@@ -1,0 +1,146 @@
+{
+ "name": "LogLens - web server log analyzer (CLI)",
+ "folder": "loglens",
+ "steps": [
+  {
+   "type": "write",
+   "path": "loglens/__init__.py",
+   "content": "__version__ = \"0.1.0\"\n"
+  },
+  {
+   "type": "write",
+   "path": "loglens/parser.py",
+   "content": "import re\nfrom dataclasses import dataclass\nfrom datetime import datetime\n\nLINE_RE = re.compile(\n    r'(?P<ip>\\S+) \\S+ \\S+ \\[(?P<time>[^\\]]+)\\] '\n    r'\"(?P<method>[A-Z]+) (?P<path>\\S+) [^\"]*\" '\n    r'(?P<status>\\d{3}) (?P<size>\\d+|-) (?P<rt>\\d+(?:\\.\\d+)?)'\n)\nTIME_FORMAT = \"%d/%b/%Y:%H:%M:%S %z\"\n\n\n@dataclass(frozen=True)\nclass Entry:\n    ip: str\n    time: datetime\n    method: str\n    path: str\n    status: int\n    size: int\n    response_time: float\n\n    @property\n    def is_error(self):\n        return self.status >= 500\n\n    @property\n    def is_client_error(self):\n        return 400 <= self.status < 500\n\n\ndef parse_line(line):\n    match = LINE_RE.match(line.strip())\n    if match is None:\n        return None\n    try:\n        when = datetime.strptime(match[\"time\"], TIME_FORMAT)\n    except ValueError:\n        return None\n    size = 0 if match[\"size\"] == \"-\" else int(match[\"size\"])\n    return Entry(\n        ip=match[\"ip\"],\n        time=when,\n        method=match[\"method\"],\n        path=match[\"path\"].split(\"?\")[0],\n        status=int(match[\"status\"]),\n        size=size,\n        response_time=float(match[\"rt\"]),\n    )\n\n\ndef parse_lines(lines):\n    \"\"\"Return (entries, malformed_count).\"\"\"\n    entries = []\n    bad = 0\n    for line in lines:\n        if not line.strip():\n            continue\n        entry = parse_line(line)\n        if entry is None:\n            bad += 1\n        else:\n            entries.append(entry)\n    return entries, bad\n\n\ndef parse_file(path):\n    with open(path, encoding=\"utf-8\", errors=\"replace\") as handle:\n        return parse_lines(handle)\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/__init__.py",
+   "content": "\"\"\"Tests for loglens.\"\"\"\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_parser.py",
+   "content": "import unittest\n\nfrom loglens.parser import parse_line, parse_lines\n\nGOOD = '10.0.0.5 - - [01/Oct/2026:08:00:17 +0000] \"GET /login?next=/home HTTP/1.1\" 200 512 0.125'\n\n\nclass ParserTests(unittest.TestCase):\n    def test_parses_fields(self):\n        entry = parse_line(GOOD)\n        self.assertEqual(entry.ip, \"10.0.0.5\")\n        self.assertEqual(entry.method, \"GET\")\n        self.assertEqual(entry.status, 200)\n        self.assertEqual(entry.size, 512)\n        self.assertAlmostEqual(entry.response_time, 0.125)\n\n    def test_query_string_is_dropped(self):\n        self.assertEqual(parse_line(GOOD).path, \"/login\")\n\n    def test_dash_size_means_zero(self):\n        line = GOOD.replace(\" 512 \", \" - \")\n        self.assertEqual(parse_line(line).size, 0)\n\n    def test_garbage_returns_none(self):\n        self.assertIsNone(parse_line(\"not a log line\"))\n\n    def test_bad_date_returns_none(self):\n        self.assertIsNone(parse_line(GOOD.replace(\"Oct\", \"Foo\")))\n\n    def test_counts_malformed_lines(self):\n        entries, bad = parse_lines([GOOD, \"junk\", \"\", GOOD])\n        self.assertEqual((len(entries), bad), (2, 1))\n\n    def test_error_flags(self):\n        entry = parse_line(GOOD.replace(\" 200 \", \" 503 \"))\n        self.assertTrue(entry.is_error)\n        self.assertFalse(entry.is_client_error)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "review",
+   "path": "loglens/parser.py"
+  },
+  {
+   "type": "write",
+   "path": "loglens/stats.py",
+   "content": "from collections import Counter\n\n\ndef top_n(entries, key, n=5):\n    counts = Counter(getattr(e, key) for e in entries)\n    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))\n    return ranked[:n]\n\n\ndef status_classes(entries):\n    counts = Counter(f\"{e.status // 100}xx\" for e in entries)\n    return dict(sorted(counts.items()))\n\n\ndef error_rate(entries):\n    if not entries:\n        return 0.0\n    return sum(1 for e in entries if e.is_error) / len(entries)\n\n\ndef timeline(entries, bucket=\"hour\"):\n    fmt = {\"hour\": \"%Y-%m-%d %H:00\", \"minute\": \"%Y-%m-%d %H:%M\", \"day\": \"%Y-%m-%d\"}[bucket]\n    counts = Counter(e.time.strftime(fmt) for e in entries)\n    return sorted(counts.items())\n\n\ndef slowest(entries, n=5):\n    return sorted(entries, key=lambda e: e.response_time, reverse=True)[:n]\n\n\ndef summarize(entries):\n    times = [e.response_time for e in entries]\n    return {\n        \"requests\": len(entries),\n        \"unique_ips\": len({e.ip for e in entries}),\n        \"bytes\": sum(e.size for e in entries),\n        \"error_rate\": round(error_rate(entries), 4),\n        \"status\": status_classes(entries),\n        \"avg_ms\": round(1000 * sum(times) / len(times), 1) if times else 0.0,\n        \"p50_ms\": round(1000 * percentile(times, 50), 1),\n        \"p95_ms\": round(1000 * percentile(times, 95), 1),\n        \"top_paths\": top_n(entries, \"path\", 3),\n    }\n\n\ndef percentile(values, pct):\n    if not values:\n        return 0.0\n    ordered = sorted(values)\n    rank = len(ordered) * pct / 100\n    low = int(rank)\n    high = min(low + 1, len(ordered) - 1)\n    return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_stats.py",
+   "content": "import unittest\nfrom datetime import datetime, timezone\n\nfrom loglens.parser import Entry\nfrom loglens.stats import percentile, summarize, timeline, top_n\n\n\ndef make(path=\"/\", status=200, minute=0, ip=\"1.1.1.1\", rt=0.1, hour=8):\n    when = datetime(2026, 10, 1, hour, minute, tzinfo=timezone.utc)\n    return Entry(ip, when, \"GET\", path, status, 100, rt)\n\n\nclass StatsTests(unittest.TestCase):\n    def test_percentile_median(self):\n        self.assertEqual(percentile([1, 2, 3, 4, 5], 50), 3)\n\n    def test_percentile_interpolates(self):\n        self.assertEqual(percentile([1, 2, 3, 4], 50), 2.5)\n\n    def test_percentile_extremes(self):\n        self.assertEqual(percentile([4, 1, 3], 0), 1)\n        self.assertEqual(percentile([4, 1, 3], 100), 4)\n\n    def test_percentile_empty(self):\n        self.assertEqual(percentile([], 95), 0.0)\n\n    def test_top_n_orders_by_count_then_name(self):\n        entries = [make(\"/b\"), make(\"/a\"), make(\"/b\"), make(\"/c\")]\n        self.assertEqual(top_n(entries, \"path\", 2), [(\"/b\", 2), (\"/a\", 1)])\n\n    def test_summary_numbers(self):\n        entries = [make(status=200), make(status=500, ip=\"2.2.2.2\"), make(status=404)]\n        s = summarize(entries)\n        self.assertEqual(s[\"requests\"], 3)\n        self.assertEqual(s[\"unique_ips\"], 2)\n        self.assertEqual(s[\"status\"], {\"2xx\": 1, \"4xx\": 1, \"5xx\": 1})\n        self.assertAlmostEqual(s[\"error_rate\"], 0.3333, places=4)\n\n    def test_summary_of_nothing(self):\n        self.assertEqual(summarize([])[\"requests\"], 0)\n\n    def test_timeline_buckets_by_hour(self):\n        entries = [make(hour=8, minute=1), make(hour=8, minute=50), make(hour=9)]\n        self.assertEqual(\n            timeline(entries, \"hour\"),\n            [(\"2026-10-01 08:00\", 2), (\"2026-10-01 09:00\", 1)],\n        )\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "pause",
+   "seconds": 6
+  },
+  {
+   "type": "write",
+   "path": "loglens/stats.py",
+   "content": "from collections import Counter\n\n\ndef top_n(entries, key, n=5):\n    counts = Counter(getattr(e, key) for e in entries)\n    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))\n    return ranked[:n]\n\n\ndef status_classes(entries):\n    counts = Counter(f\"{e.status // 100}xx\" for e in entries)\n    return dict(sorted(counts.items()))\n\n\ndef error_rate(entries):\n    if not entries:\n        return 0.0\n    return sum(1 for e in entries if e.is_error) / len(entries)\n\n\ndef timeline(entries, bucket=\"hour\"):\n    fmt = {\"hour\": \"%Y-%m-%d %H:00\", \"minute\": \"%Y-%m-%d %H:%M\", \"day\": \"%Y-%m-%d\"}[bucket]\n    counts = Counter(e.time.strftime(fmt) for e in entries)\n    return sorted(counts.items())\n\n\ndef slowest(entries, n=5):\n    return sorted(entries, key=lambda e: e.response_time, reverse=True)[:n]\n\n\ndef summarize(entries):\n    times = [e.response_time for e in entries]\n    return {\n        \"requests\": len(entries),\n        \"unique_ips\": len({e.ip for e in entries}),\n        \"bytes\": sum(e.size for e in entries),\n        \"error_rate\": round(error_rate(entries), 4),\n        \"status\": status_classes(entries),\n        \"avg_ms\": round(1000 * sum(times) / len(times), 1) if times else 0.0,\n        \"p50_ms\": round(1000 * percentile(times, 50), 1),\n        \"p95_ms\": round(1000 * percentile(times, 95), 1),\n        \"top_paths\": top_n(entries, \"path\", 3),\n    }\n\n\ndef percentile(values, pct):\n    if not values:\n        return 0.0\n    ordered = sorted(values)\n    rank = (len(ordered) - 1) * pct / 100\n    low = int(rank)\n    high = min(low + 1, len(ordered) - 1)\n    return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "review",
+   "path": "loglens/stats.py"
+  },
+  {
+   "type": "write",
+   "path": "loglens/report.py",
+   "content": "import csv\nimport io\nimport json\n\n\ndef format_table(rows, headers):\n    table = [list(map(str, headers))] + [[str(c) for c in row] for row in rows]\n    widths = [max(len(r[i]) for r in table) for i in range(len(headers))]\n    lines = []\n    for n, row in enumerate(table):\n        lines.append(\"  \".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())\n        if n == 0:\n            lines.append(\"  \".join(\"-\" * w for w in widths))\n    return \"\\n\".join(lines)\n\n\ndef to_csv(rows, headers):\n    buf = io.StringIO()\n    writer = csv.writer(buf, lineterminator=\"\\n\")\n    writer.writerow(headers)\n    writer.writerows(rows)\n    return buf.getvalue()\n\n\ndef render_summary(stats, malformed=0, fmt=\"text\"):\n    if fmt == \"json\":\n        return json.dumps({**stats, \"malformed_lines\": malformed}, indent=2)\n    lines = [\n        f\"Requests:      {stats['requests']}\",\n        f\"Unique IPs:    {stats['unique_ips']}\",\n        f\"Bytes sent:    {stats['bytes']}\",\n        f\"Error rate:    {stats['error_rate']:.1f}%\",\n        f\"Latency (ms):  avg {stats['avg_ms']}  p50 {stats['p50_ms']}  p95 {stats['p95_ms']}\",\n        \"Status:        \" + \", \".join(f\"{k}={v}\" for k, v in stats[\"status\"].items()),\n    ]\n    if malformed:\n        lines.append(f\"Malformed:     {malformed} line(s) skipped\")\n    return \"\\n\".join(lines)\n"
+  },
+  {
+   "type": "write",
+   "path": "loglens/cli.py",
+   "content": "import argparse\nimport sys\n\nfrom . import report, stats\nfrom .parser import parse_file\n\n\ndef build_parser():\n    parser = argparse.ArgumentParser(prog=\"loglens\", description=\"Analyse web server access logs.\")\n    sub = parser.add_subparsers(dest=\"command\", required=True)\n\n    summary = sub.add_parser(\"summary\", help=\"overall numbers\")\n    summary.add_argument(\"file\")\n    summary.add_argument(\"--format\", choices=[\"text\", \"json\"], default=\"text\")\n\n    top = sub.add_parser(\"top\", help=\"most common paths or IPs\")\n    top.add_argument(\"file\")\n    top.add_argument(\"--by\", choices=[\"path\", \"ip\"], default=\"path\")\n    top.add_argument(\"-n\", type=int, default=5)\n    top.add_argument(\"--csv\", action=\"store_true\")\n\n    errors = sub.add_parser(\"errors\", help=\"5xx responses\")\n    errors.add_argument(\"file\")\n\n    timeline = sub.add_parser(\"timeline\", help=\"requests over time\")\n    timeline.add_argument(\"file\")\n    timeline.add_argument(\"--bucket\", choices=[\"minute\", \"hour\", \"day\"], default=\"hour\")\n    return parser\n\n\ndef main(argv=None, out=None):\n    out = out or sys.stdout\n    args = build_parser().parse_args(argv)\n    try:\n        entries, malformed = parse_file(args.file)\n    except OSError as exc:\n        print(f\"loglens: {exc}\", file=sys.stderr)\n        return 2\n\n    if args.command == \"summary\":\n        print(report.render_summary(stats.summarize(entries), malformed, args.format), file=out)\n    elif args.command == \"top\":\n        rows = stats.top_n(entries, args.by, args.n)\n        headers = [args.by, \"requests\"]\n        text = report.to_csv(rows, headers) if args.csv else report.format_table(rows, headers)\n        print(text, file=out)\n    elif args.command == \"errors\":\n        bad = [e for e in entries if e.is_error]\n        rows = [(e.time.strftime(\"%H:%M:%S\"), e.status, e.path, e.ip) for e in bad]\n        print(report.format_table(rows, [\"time\", \"status\", \"path\", \"ip\"]), file=out)\n        print(f\"\\n{len(bad)} error(s) out of {len(entries)} requests\", file=out)\n    elif args.command == \"timeline\":\n        rows = stats.timeline(entries, args.bucket)\n        rows = [(label, count, \"#\" * min(count, 40)) for label, count in rows]\n        print(report.format_table(rows, [\"when\", \"requests\", \"\"]), file=out)\n    return 0\n"
+  },
+  {
+   "type": "write",
+   "path": "loglens/__main__.py",
+   "content": "from .cli import main\n\nraise SystemExit(main())\n"
+  },
+  {
+   "type": "write",
+   "path": "make_sample.py",
+   "content": "import random\nfrom datetime import datetime, timedelta, timezone\n\nPATHS = [\"/\", \"/index.html\", \"/login\", \"/api/items\", \"/api/items/42\",\n         \"/static/app.js\", \"/checkout\", \"/search?q=shoes\"]\nIPS = [f\"10.0.0.{n}\" for n in range(1, 13)]\n\n\ndef make_lines(count=500, seed=7):\n    rng = random.Random(seed)\n    start = datetime(2026, 10, 1, 8, 0, 0, tzinfo=timezone.utc)\n    lines = []\n    for n in range(count):\n        when = start + timedelta(seconds=n * 17 + rng.randint(0, 9))\n        status = rng.choices([200, 301, 404, 500, 503], weights=[80, 5, 8, 5, 2])[0]\n        size = rng.randint(200, 9000)\n        rt = round(rng.uniform(0.01, 0.4) + (0.8 if status >= 500 else 0), 3)\n        lines.append(\n            f'{rng.choice(IPS)} - - [{when.strftime(\"%d/%b/%Y:%H:%M:%S %z\")}] '\n            f'\"GET {rng.choice(PATHS)} HTTP/1.1\" {status} {size} {rt}'\n        )\n    lines.insert(10, \"this line is not a log entry\")\n    return lines\n\n\nif __name__ == \"__main__\":\n    with open(\"sample.log\", \"w\") as handle:\n        handle.write(\"\\n\".join(make_lines()) + \"\\n\")\n    print(\"wrote sample.log\")\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} make_sample.py",
+   "wait": 3
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m loglens summary sample.log",
+   "wait": 4
+  },
+  {
+   "type": "pause",
+   "seconds": 5
+  },
+  {
+   "type": "write",
+   "path": "loglens/report.py",
+   "content": "import csv\nimport io\nimport json\n\n\ndef format_table(rows, headers):\n    table = [list(map(str, headers))] + [[str(c) for c in row] for row in rows]\n    widths = [max(len(r[i]) for r in table) for i in range(len(headers))]\n    lines = []\n    for n, row in enumerate(table):\n        lines.append(\"  \".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())\n        if n == 0:\n            lines.append(\"  \".join(\"-\" * w for w in widths))\n    return \"\\n\".join(lines)\n\n\ndef to_csv(rows, headers):\n    buf = io.StringIO()\n    writer = csv.writer(buf, lineterminator=\"\\n\")\n    writer.writerow(headers)\n    writer.writerows(rows)\n    return buf.getvalue()\n\n\ndef render_summary(stats, malformed=0, fmt=\"text\"):\n    if fmt == \"json\":\n        return json.dumps({**stats, \"malformed_lines\": malformed}, indent=2)\n    lines = [\n        f\"Requests:      {stats['requests']}\",\n        f\"Unique IPs:    {stats['unique_ips']}\",\n        f\"Bytes sent:    {stats['bytes']}\",\n        f\"Error rate:    {stats['error_rate'] * 100:.1f}%\",\n        f\"Latency (ms):  avg {stats['avg_ms']}  p50 {stats['p50_ms']}  p95 {stats['p95_ms']}\",\n        \"Status:        \" + \", \".join(f\"{k}={v}\" for k, v in stats[\"status\"].items()),\n    ]\n    if malformed:\n        lines.append(f\"Malformed:     {malformed} line(s) skipped\")\n    return \"\\n\".join(lines)\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m loglens summary sample.log",
+   "wait": 4
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m loglens top sample.log --by ip -n 3",
+   "wait": 4
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m loglens errors sample.log",
+   "wait": 4
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m loglens timeline sample.log --bucket hour",
+   "wait": 4
+  },
+  {
+   "type": "write",
+   "path": "tests/test_cli.py",
+   "content": "import io\nimport json\nimport os\nimport tempfile\nimport unittest\n\nfrom loglens.cli import main\nfrom make_sample import make_lines\n\n\nclass CliTests(unittest.TestCase):\n    def setUp(self):\n        self.tmp = tempfile.TemporaryDirectory()\n        self.path = os.path.join(self.tmp.name, \"access.log\")\n        with open(self.path, \"w\") as handle:\n            handle.write(\"\\n\".join(make_lines(200)) + \"\\n\")\n\n    def tearDown(self):\n        self.tmp.cleanup()\n\n    def run_cli(self, *args):\n        out = io.StringIO()\n        code = main(list(args), out=out)\n        return code, out.getvalue()\n\n    def test_summary_text(self):\n        code, text = self.run_cli(\"summary\", self.path)\n        self.assertEqual(code, 0)\n        self.assertIn(\"Requests:      200\", text)\n        self.assertIn(\"Malformed:     1\", text)\n\n    def test_summary_json(self):\n        _, text = self.run_cli(\"summary\", self.path, \"--format\", \"json\")\n        self.assertEqual(json.loads(text)[\"requests\"], 200)\n\n    def test_top_csv(self):\n        _, text = self.run_cli(\"top\", self.path, \"--by\", \"ip\", \"-n\", \"3\", \"--csv\")\n        lines = text.strip().splitlines()\n        self.assertEqual(lines[0], \"ip,requests\")\n        self.assertEqual(len(lines), 4)\n\n    def test_errors_lists_only_5xx(self):\n        _, text = self.run_cli(\"errors\", self.path)\n        self.assertIn(\"error(s) out of 200 requests\", text)\n\n    def test_missing_file(self):\n        code, _ = self.run_cli(\"summary\", os.path.join(self.tmp.name, \"nope.log\"))\n        self.assertEqual(code, 2)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 6
+  },
+  {
+   "type": "review",
+   "path": "loglens/cli.py"
+  },
+  {
+   "type": "write",
+   "path": "README.md",
+   "content": "# LogLens\n\nCommand line analyser for web server access logs.\n\n    python make_sample.py\n    python -m loglens summary sample.log\n    python -m loglens top sample.log --by ip -n 3\n    python -m loglens errors sample.log\n    python -m loglens timeline sample.log --bucket hour\n    python -m unittest -v\n"
+  }
+ ]
+}

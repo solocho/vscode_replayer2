@@ -1,0 +1,189 @@
+{
+ "name": "InvoiceDesk - Flask + SQLite client and invoice tracker",
+ "folder": "invoicedesk",
+ "steps": [
+  {
+   "type": "write",
+   "path": "requirements.txt",
+   "content": "flask\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m pip install -r requirements.txt",
+   "wait": 30
+  },
+  {
+   "type": "write",
+   "path": "db.py",
+   "content": "import os\nimport sqlite3\nfrom contextlib import contextmanager\n\nDB_PATH = os.environ.get(\"INVOICE_DB\", \"invoices.db\")\n\nSCHEMA = \"\"\"\nCREATE TABLE IF NOT EXISTS clients (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    name TEXT NOT NULL,\n    email TEXT,\n    company TEXT\n);\n\nCREATE TABLE IF NOT EXISTS invoices (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    number TEXT NOT NULL UNIQUE,\n    client_id INTEGER NOT NULL REFERENCES clients(id),\n    issued TEXT NOT NULL,\n    due TEXT NOT NULL,\n    status TEXT NOT NULL DEFAULT 'sent',\n    tax_rate REAL NOT NULL DEFAULT 0\n);\n\nCREATE TABLE IF NOT EXISTS items (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,\n    description TEXT NOT NULL,\n    qty REAL NOT NULL,\n    unit_price REAL NOT NULL\n);\n\"\"\"\n\n\n@contextmanager\ndef session():\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    conn.execute(\"PRAGMA foreign_keys = ON\")\n    try:\n        yield conn\n        conn.commit()\n    finally:\n        conn.close()\n\n\ndef init_db():\n    with session() as conn:\n        conn.executescript(SCHEMA)\n"
+  },
+  {
+   "type": "write",
+   "path": "services.py",
+   "content": "from datetime import date, timedelta\n\nfrom db import session\n\nSTATUSES = (\"draft\", \"sent\", \"paid\")\n\n\ndef add_client(name, email=\"\", company=\"\"):\n    with session() as conn:\n        cur = conn.execute(\n            \"INSERT INTO clients (name, email, company) VALUES (?, ?, ?)\",\n            (name.strip(), email.strip(), company.strip()),\n        )\n        return cur.lastrowid\n\n\ndef list_clients():\n    with session() as conn:\n        return conn.execute(\"SELECT * FROM clients ORDER BY name\").fetchall()\n\n\ndef delete_client(client_id):\n    with session() as conn:\n        count = conn.execute(\n            \"SELECT COUNT(*) FROM invoices WHERE client_id = ?\", (client_id,)\n        ).fetchone()[0]\n        if count:\n            return False\n        conn.execute(\"DELETE FROM clients WHERE id = ?\", (client_id,))\n        return True\n\n\ndef create_invoice(client_id, issued, due, items, tax_rate=0.0, status=\"sent\"):\n    with session() as conn:\n        last = conn.execute(\"SELECT COALESCE(MAX(id), 0) FROM invoices\").fetchone()[0]\n        cur = conn.execute(\n            \"INSERT INTO invoices (number, client_id, issued, due, status, tax_rate) \"\n            \"VALUES (?, ?, ?, ?, ?, ?)\",\n            (f\"INV-{last + 1:04d}\", client_id, issued, due, status, tax_rate),\n        )\n        invoice_id = cur.lastrowid\n        for item in items:\n            conn.execute(\n                \"INSERT INTO items (invoice_id, description, qty, unit_price) \"\n                \"VALUES (?, ?, ?, ?)\",\n                (invoice_id, item[\"description\"], item[\"qty\"], item[\"unit_price\"]),\n            )\n        return invoice_id\n\n\ndef get_invoice(invoice_id):\n    with session() as conn:\n        row = conn.execute(\n            \"SELECT invoices.*, clients.name AS client_name, clients.email AS client_email \"\n            \"FROM invoices JOIN clients ON clients.id = invoices.client_id \"\n            \"WHERE invoices.id = ?\",\n            (invoice_id,),\n        ).fetchone()\n        if row is None:\n            return None\n        items = conn.execute(\n            \"SELECT * FROM items WHERE invoice_id = ?\", (invoice_id,)\n        ).fetchall()\n    data = dict(row)\n    data[\"items\"] = [dict(i) for i in items]\n    data.update(compute_totals(data[\"items\"], data[\"tax_rate\"]))\n    data[\"overdue\"] = is_overdue(data)\n    return data\n\n\ndef list_invoices(status=None):\n    with session() as conn:\n        ids = [r[\"id\"] for r in conn.execute(\"SELECT id FROM invoices ORDER BY id DESC\")]\n    invoices = [get_invoice(i) for i in ids]\n    if status == \"overdue\":\n        return [i for i in invoices if i[\"overdue\"]]\n    if status:\n        return [i for i in invoices if i[\"status\"] == status]\n    return invoices\n\n\ndef set_status(invoice_id, status):\n    if status not in STATUSES:\n        raise ValueError(f\"bad status: {status}\")\n    with session() as conn:\n        conn.execute(\"UPDATE invoices SET status = ? WHERE id = ?\", (status, invoice_id))\n\n\ndef delete_invoice(invoice_id):\n    with session() as conn:\n        conn.execute(\"DELETE FROM invoices WHERE id = ?\", (invoice_id,))\n\n\ndef dashboard():\n    invoices = list_invoices()\n    overdue = [i for i in invoices if i[\"overdue\"]]\n    return {\n        \"outstanding\": round(sum(i[\"total\"] for i in invoices if i[\"status\"] == \"sent\"), 2),\n        \"paid\": round(sum(i[\"total\"] for i in invoices if i[\"status\"] == \"paid\"), 2),\n        \"overdue_count\": len(overdue),\n        \"overdue_total\": round(sum(i[\"total\"] for i in overdue), 2),\n        \"recent\": invoices[:5],\n    }\n\n\ndef compute_totals(items, tax_rate):\n    subtotal = sum(i[\"unit_price\"] for i in items)\n    tax = subtotal * tax_rate / 100\n    return {\n        \"subtotal\": round(subtotal, 2),\n        \"tax\": round(tax, 2),\n        \"total\": round(subtotal + tax, 2),\n    }\n\n\ndef is_overdue(invoice):\n    return invoice[\"status\"] == \"sent\" and invoice[\"due\"] < date.today().isoformat()\n\n\ndef default_due(issued, days=14):\n    return (date.fromisoformat(issued) + timedelta(days=days)).isoformat()\n"
+  },
+  {
+   "type": "write",
+   "path": "test_services.py",
+   "content": "import os\nimport tempfile\nimport unittest\nfrom datetime import date, timedelta\n\nimport db\nimport services\n\n\nclass ServiceTests(unittest.TestCase):\n    def setUp(self):\n        fd, self.path = tempfile.mkstemp(suffix=\".db\")\n        os.close(fd)\n        db.DB_PATH = self.path\n        db.init_db()\n        self.client_id = services.add_client(\"Acme Ltd\", \"billing@acme.test\", \"Acme\")\n\n    def tearDown(self):\n        os.remove(self.path)\n\n    def make_invoice(self, due_days=14, status=\"sent\", tax=0.0):\n        today = date.today()\n        return services.create_invoice(\n            self.client_id,\n            today.isoformat(),\n            (today + timedelta(days=due_days)).isoformat(),\n            [\n                {\"description\": \"Design work\", \"qty\": 10, \"unit_price\": 50},\n                {\"description\": \"Hosting\", \"qty\": 1, \"unit_price\": 25},\n            ],\n            tax_rate=tax,\n            status=status,\n        )\n\n    def test_totals_use_quantity(self):\n        inv = services.get_invoice(self.make_invoice())\n        self.assertEqual(inv[\"subtotal\"], 525)\n        self.assertEqual(inv[\"total\"], 525)\n\n    def test_tax_is_added(self):\n        inv = services.get_invoice(self.make_invoice(tax=16))\n        self.assertEqual(inv[\"tax\"], 84)\n        self.assertEqual(inv[\"total\"], 609)\n\n    def test_invoice_numbers_increase(self):\n        a = services.get_invoice(self.make_invoice())\n        b = services.get_invoice(self.make_invoice())\n        self.assertEqual((a[\"number\"], b[\"number\"]), (\"INV-0001\", \"INV-0002\"))\n\n    def test_overdue_only_when_sent_and_past_due(self):\n        late = services.get_invoice(self.make_invoice(due_days=-3))\n        paid_late = services.get_invoice(self.make_invoice(due_days=-3, status=\"paid\"))\n        self.assertTrue(late[\"overdue\"])\n        self.assertFalse(paid_late[\"overdue\"])\n\n    def test_dashboard_totals(self):\n        self.make_invoice()\n        self.make_invoice(status=\"paid\")\n        stats = services.dashboard()\n        self.assertEqual(stats[\"outstanding\"], 525)\n        self.assertEqual(stats[\"paid\"], 525)\n\n    def test_cannot_delete_client_with_invoices(self):\n        self.make_invoice()\n        self.assertFalse(services.delete_client(self.client_id))\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 6
+  },
+  {
+   "type": "pause",
+   "seconds": 5
+  },
+  {
+   "type": "write",
+   "path": "services.py",
+   "content": "from datetime import date, timedelta\n\nfrom db import session\n\nSTATUSES = (\"draft\", \"sent\", \"paid\")\n\n\ndef add_client(name, email=\"\", company=\"\"):\n    with session() as conn:\n        cur = conn.execute(\n            \"INSERT INTO clients (name, email, company) VALUES (?, ?, ?)\",\n            (name.strip(), email.strip(), company.strip()),\n        )\n        return cur.lastrowid\n\n\ndef list_clients():\n    with session() as conn:\n        return conn.execute(\"SELECT * FROM clients ORDER BY name\").fetchall()\n\n\ndef delete_client(client_id):\n    with session() as conn:\n        count = conn.execute(\n            \"SELECT COUNT(*) FROM invoices WHERE client_id = ?\", (client_id,)\n        ).fetchone()[0]\n        if count:\n            return False\n        conn.execute(\"DELETE FROM clients WHERE id = ?\", (client_id,))\n        return True\n\n\ndef create_invoice(client_id, issued, due, items, tax_rate=0.0, status=\"sent\"):\n    with session() as conn:\n        last = conn.execute(\"SELECT COALESCE(MAX(id), 0) FROM invoices\").fetchone()[0]\n        cur = conn.execute(\n            \"INSERT INTO invoices (number, client_id, issued, due, status, tax_rate) \"\n            \"VALUES (?, ?, ?, ?, ?, ?)\",\n            (f\"INV-{last + 1:04d}\", client_id, issued, due, status, tax_rate),\n        )\n        invoice_id = cur.lastrowid\n        for item in items:\n            conn.execute(\n                \"INSERT INTO items (invoice_id, description, qty, unit_price) \"\n                \"VALUES (?, ?, ?, ?)\",\n                (invoice_id, item[\"description\"], item[\"qty\"], item[\"unit_price\"]),\n            )\n        return invoice_id\n\n\ndef get_invoice(invoice_id):\n    with session() as conn:\n        row = conn.execute(\n            \"SELECT invoices.*, clients.name AS client_name, clients.email AS client_email \"\n            \"FROM invoices JOIN clients ON clients.id = invoices.client_id \"\n            \"WHERE invoices.id = ?\",\n            (invoice_id,),\n        ).fetchone()\n        if row is None:\n            return None\n        items = conn.execute(\n            \"SELECT * FROM items WHERE invoice_id = ?\", (invoice_id,)\n        ).fetchall()\n    data = dict(row)\n    data[\"items\"] = [dict(i) for i in items]\n    data.update(compute_totals(data[\"items\"], data[\"tax_rate\"]))\n    data[\"overdue\"] = is_overdue(data)\n    return data\n\n\ndef list_invoices(status=None):\n    with session() as conn:\n        ids = [r[\"id\"] for r in conn.execute(\"SELECT id FROM invoices ORDER BY id DESC\")]\n    invoices = [get_invoice(i) for i in ids]\n    if status == \"overdue\":\n        return [i for i in invoices if i[\"overdue\"]]\n    if status:\n        return [i for i in invoices if i[\"status\"] == status]\n    return invoices\n\n\ndef set_status(invoice_id, status):\n    if status not in STATUSES:\n        raise ValueError(f\"bad status: {status}\")\n    with session() as conn:\n        conn.execute(\"UPDATE invoices SET status = ? WHERE id = ?\", (status, invoice_id))\n\n\ndef delete_invoice(invoice_id):\n    with session() as conn:\n        conn.execute(\"DELETE FROM invoices WHERE id = ?\", (invoice_id,))\n\n\ndef dashboard():\n    invoices = list_invoices()\n    overdue = [i for i in invoices if i[\"overdue\"]]\n    return {\n        \"outstanding\": round(sum(i[\"total\"] for i in invoices if i[\"status\"] == \"sent\"), 2),\n        \"paid\": round(sum(i[\"total\"] for i in invoices if i[\"status\"] == \"paid\"), 2),\n        \"overdue_count\": len(overdue),\n        \"overdue_total\": round(sum(i[\"total\"] for i in overdue), 2),\n        \"recent\": invoices[:5],\n    }\n\n\ndef compute_totals(items, tax_rate):\n    subtotal = sum(i[\"qty\"] * i[\"unit_price\"] for i in items)\n    tax = subtotal * tax_rate / 100\n    return {\n        \"subtotal\": round(subtotal, 2),\n        \"tax\": round(tax, 2),\n        \"total\": round(subtotal + tax, 2),\n    }\n\n\ndef is_overdue(invoice):\n    return invoice[\"status\"] == \"sent\" and invoice[\"due\"] < date.today().isoformat()\n\n\ndef default_due(issued, days=14):\n    return (date.fromisoformat(issued) + timedelta(days=days)).isoformat()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 6
+  },
+  {
+   "type": "review",
+   "path": "services.py"
+  },
+  {
+   "type": "write",
+   "path": "app.py",
+   "content": "from datetime import date\n\nfrom flask import Flask, abort, flash, redirect, render_template, request, url_for\n\nimport db\nimport services\n\napp = Flask(__name__)\napp.secret_key = \"dev-only-change-me\"\n\n\ndef parse_items(form):\n    items = []\n    rows = zip(form.getlist(\"description\"), form.getlist(\"qty\"), form.getlist(\"unit_price\"))\n    for desc, qty, price in rows:\n        if not desc.strip():\n            continue\n        try:\n            items.append({\n                \"description\": desc.strip(),\n                \"qty\": float(qty or 1),\n                \"unit_price\": float(price or 0),\n            })\n        except ValueError:\n            continue\n    return items\n\n\n@app.route(\"/\")\ndef index():\n    stats = services.dashboard()\n    return render_template(\"index.html\", stats=stats, invoices=stats[\"recent\"])\n\n\n@app.route(\"/clients\")\ndef clients():\n    return render_template(\"clients.html\", clients=services.list_clients())\n\n\n@app.route(\"/clients/new\", methods=[\"GET\", \"POST\"])\ndef client_new():\n    if request.method == \"POST\":\n        name = request.form[\"name\"].strip()\n        if not name:\n            flash(\"Name is required.\")\n        else:\n            services.add_client(name, request.form.get(\"email\", \"\"), request.form.get(\"company\", \"\"))\n            flash(\"Client added.\")\n            return redirect(url_for(\"clients\"))\n    return render_template(\"client_form.html\")\n\n\n@app.route(\"/clients/<int:client_id>/delete\", methods=[\"POST\"])\ndef client_delete(client_id):\n    if services.delete_client(client_id):\n        flash(\"Client deleted.\")\n    else:\n        flash(\"Can't delete a client who has invoices.\")\n    return redirect(url_for(\"clients\"))\n\n\n@app.route(\"/invoices\")\ndef invoices():\n    status = request.args.get(\"status\")\n    return render_template(\"invoices.html\", invoices=services.list_invoices(status))\n\n\n@app.route(\"/invoices/new\", methods=[\"GET\", \"POST\"])\ndef invoice_new():\n    if request.method == \"POST\":\n        items = parse_items(request.form)\n        if not items:\n            flash(\"Add at least one line item.\")\n        else:\n            issued = request.form.get(\"issued\") or date.today().isoformat()\n            due = request.form.get(\"due\") or services.default_due(issued)\n            invoice_id = services.create_invoice(\n                int(request.form[\"client_id\"]), issued, due, items,\n                tax_rate=float(request.form.get(\"tax_rate\") or 0),\n            )\n            flash(\"Invoice created.\")\n            return redirect(url_for(\"invoice_detail\", invoice_id=invoice_id))\n    return render_template(\n        \"invoice_form.html\", clients=services.list_clients(), today=date.today().isoformat()\n    )\n\n\n@app.route(\"/invoices/<int:invoice_id>\")\ndef invoice_detail(invoice_id):\n    invoice = services.get_invoice(invoice_id)\n    if invoice is None:\n        abort(404)\n    return render_template(\"invoice_detail.html\", invoice=invoice)\n\n\n@app.route(\"/invoices/<int:invoice_id>/status\", methods=[\"POST\"])\ndef invoice_status(invoice_id):\n    try:\n        services.set_status(invoice_id, request.form[\"status\"])\n    except ValueError:\n        abort(400)\n    return redirect(url_for(\"invoice_detail\", invoice_id=invoice_id))\n\n\n@app.route(\"/invoices/<int:invoice_id>/delete\", methods=[\"POST\"])\ndef invoice_delete(invoice_id):\n    services.delete_invoice(invoice_id)\n    flash(\"Invoice deleted.\")\n    return redirect(url_for(\"invoices\"))\n\n\n@app.route(\"/api/summary\")\ndef api_summary():\n    stats = services.dashboard()\n    stats.pop(\"recent\")\n    return stats\n\n\nif __name__ == \"__main__\":\n    db.init_db()\n    app.run(debug=True)\n"
+  },
+  {
+   "type": "write",
+   "path": "templates/base.html",
+   "content": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>{% block title %}InvoiceDesk{% endblock %}</title>\n<link rel=\"stylesheet\" href=\"{{ url_for('static', filename='style.css') }}\">\n</head>\n<body>\n<nav>\n  <a class=\"brand\" href=\"{{ url_for('index') }}\">InvoiceDesk</a>\n  <a href=\"{{ url_for('clients') }}\">Clients</a>\n  <a href=\"{{ url_for('invoices') }}\">Invoices</a>\n  <a class=\"button\" href=\"{{ url_for('invoice_new') }}\">New invoice</a>\n</nav>\n<main>\n{% for message in get_flashed_messages() %}\n  <p class=\"flash\">{{ message }}</p>\n{% endfor %}\n{% block content %}{% endblock %}\n</main>\n</body>\n</html>\n"
+  },
+  {
+   "type": "write",
+   "path": "templates/index.html",
+   "content": "{% extends \"base.html\" %}\n{% block content %}\n<h1>Dashboard</h1>\n<div class=\"cards\">\n  <div class=\"card\"><span>Outstanding</span><strong>{{ \"%.2f\"|format(stats.outstanding) }}</strong></div>\n  <div class=\"card\"><span>Paid</span><strong>{{ \"%.2f\"|format(stats.paid) }}</strong></div>\n  <div class=\"card warn\"><span>Overdue ({{ stats.overdue_count }})</span><strong>{{ \"%.2f\"|format(stats.overdue_total) }}</strong></div>\n</div>\n<h2>Recent invoices</h2>\n{% include \"_invoice_table.html\" %}\n{% endblock %}\n"
+  },
+  {
+   "type": "write",
+   "path": "templates/_invoice_table.html",
+   "content": "{% if invoices %}\n<table>\n  <tr><th>Number</th><th>Client</th><th>Due</th><th>Status</th><th class=\"num\">Total</th></tr>\n  {% for inv in invoices %}\n  <tr>\n    <td><a href=\"{{ url_for('invoice_detail', invoice_id=inv.id) }}\">{{ inv.number }}</a></td>\n    <td>{{ inv.client_name }}</td>\n    <td>{{ inv.due }}</td>\n    <td><span class=\"badge {{ 'overdue' if inv.overdue else inv.status }}\">{{ 'overdue' if inv.overdue else inv.status }}</span></td>\n    <td class=\"num\">{{ \"%.2f\"|format(inv.total) }}</td>\n  </tr>\n  {% endfor %}\n</table>\n{% else %}\n<p class=\"empty\">No invoices yet.</p>\n{% endif %}\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} app.py",
+   "wait": 8,
+   "new_terminal": true
+  },
+  {
+   "type": "browser",
+   "url": "http://127.0.0.1:5000/",
+   "wait": 6
+  },
+  {
+   "type": "write",
+   "path": "seed.py",
+   "content": "from datetime import date, timedelta\n\nimport db\nimport services\n\ndb.init_db()\ntoday = date.today()\n\n\ndef days(n):\n    return (today + timedelta(days=n)).isoformat()\n\n\nacme = services.add_client(\"Acme Ltd\", \"billing@acme.test\", \"Acme\")\nzuri = services.add_client(\"Zuri Studio\", \"hello@zuri.test\", \"Zuri Studio\")\n\nservices.create_invoice(acme, days(-30), days(-16),\n                        [{\"description\": \"Website design\", \"qty\": 12, \"unit_price\": 60}], tax_rate=16)\nservices.create_invoice(acme, days(-5), days(9),\n                        [{\"description\": \"Hosting (yearly)\", \"qty\": 1, \"unit_price\": 120}])\nservices.create_invoice(zuri, days(-20), days(-6),\n                        [{\"description\": \"Logo pack\", \"qty\": 1, \"unit_price\": 300}], status=\"paid\")\nservices.create_invoice(zuri, days(-2), days(12),\n                        [{\"description\": \"Consulting\", \"qty\": 5, \"unit_price\": 80}])\nprint(\"Seeded demo data.\")\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} seed.py",
+   "wait": 4,
+   "new_terminal": true
+  },
+  {
+   "type": "browser",
+   "refresh": true,
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "templates/clients.html",
+   "content": "{% extends \"base.html\" %}\n{% block content %}\n<h1>Clients</h1>\n<p><a class=\"button\" href=\"{{ url_for('client_new') }}\">Add client</a></p>\n{% if clients %}\n<table>\n  <tr><th>Name</th><th>Company</th><th>Email</th><th></th></tr>\n  {% for c in clients %}\n  <tr>\n    <td>{{ c.name }}</td>\n    <td>{{ c.company }}</td>\n    <td>{{ c.email }}</td>\n    <td>\n      <form method=\"post\" action=\"{{ url_for('client_delete', client_id=c.id) }}\">\n        <button class=\"link\">Delete</button>\n      </form>\n    </td>\n  </tr>\n  {% endfor %}\n</table>\n{% else %}\n<p class=\"empty\">No clients yet.</p>\n{% endif %}\n{% endblock %}\n"
+  },
+  {
+   "type": "write",
+   "path": "templates/client_form.html",
+   "content": "{% extends \"base.html\" %}\n{% block content %}\n<h1>Add client</h1>\n<form method=\"post\">\n  <label>Name <input name=\"name\" required></label>\n  <label>Company <input name=\"company\"></label>\n  <label>Email <input name=\"email\" type=\"email\"></label>\n  <button>Save</button>\n</form>\n{% endblock %}\n"
+  },
+  {
+   "type": "write",
+   "path": "templates/invoices.html",
+   "content": "{% extends \"base.html\" %}\n{% block title %}Invoices{% endblock %}\n{% block content %}\n<h1>Invoices</h1>\n<p class=\"filters\">\n  <a href=\"{{ url_for('invoices') }}\">All</a>\n  <a href=\"{{ url_for('invoices', status='sent') }}\">Sent</a>\n  <a href=\"{{ url_for('invoices', status='paid') }}\">Paid</a>\n  <a href=\"{{ url_for('invoices', status='overdue') }}\">Overdue</a>\n</p>\n{% include \"_invoice_table.html\" %}\n<p><a href=\"{{ url_for('dashboard') }}\">Back to dashboard</a></p>\n{% endblock %}\n"
+  },
+  {
+   "type": "write",
+   "path": "templates/invoice_form.html",
+   "content": "{% extends \"base.html\" %}\n{% block content %}\n<h1>New invoice</h1>\n{% if not clients %}\n<p class=\"empty\">Add a <a href=\"{{ url_for('client_new') }}\">client</a> first.</p>\n{% else %}\n<form method=\"post\">\n  <label>Client\n    <select name=\"client_id\">\n      {% for c in clients %}<option value=\"{{ c.id }}\">{{ c.name }}</option>{% endfor %}\n    </select>\n  </label>\n  <label>Issued <input type=\"date\" name=\"issued\" value=\"{{ today }}\"></label>\n  <label>Due (blank = 14 days) <input type=\"date\" name=\"due\"></label>\n  <label>Tax % <input name=\"tax_rate\" value=\"0\"></label>\n  <h2>Line items</h2>\n  {% for n in range(4) %}\n  <div class=\"row\">\n    <input name=\"description\" placeholder=\"Description\">\n    <input name=\"qty\" placeholder=\"Qty\" value=\"1\">\n    <input name=\"unit_price\" placeholder=\"Unit price\">\n  </div>\n  {% endfor %}\n  <button>Create invoice</button>\n</form>\n{% endif %}\n{% endblock %}\n"
+  },
+  {
+   "type": "write",
+   "path": "templates/invoice_detail.html",
+   "content": "{% extends \"base.html\" %}\n{% block title %}{{ invoice.number }}{% endblock %}\n{% block content %}\n<h1>{{ invoice.number }}\n  <span class=\"badge {{ 'overdue' if invoice.overdue else invoice.status }}\">{{ 'overdue' if invoice.overdue else invoice.status }}</span>\n</h1>\n<p>Billed to <strong>{{ invoice.client_name }}</strong> ({{ invoice.client_email }})<br>\nIssued {{ invoice.issued }} &middot; Due {{ invoice.due }}</p>\n<table>\n  <tr><th>Description</th><th class=\"num\">Qty</th><th class=\"num\">Price</th><th class=\"num\">Amount</th></tr>\n  {% for i in invoice['items'] %}\n  <tr>\n    <td>{{ i.description }}</td>\n    <td class=\"num\">{{ i.qty }}</td>\n    <td class=\"num\">{{ \"%.2f\"|format(i.unit_price) }}</td>\n    <td class=\"num\">{{ \"%.2f\"|format(i.qty * i.unit_price) }}</td>\n  </tr>\n  {% endfor %}\n  <tr class=\"sum\"><td colspan=\"3\">Subtotal</td><td class=\"num\">{{ \"%.2f\"|format(invoice.subtotal) }}</td></tr>\n  <tr class=\"sum\"><td colspan=\"3\">Tax ({{ invoice.tax_rate }}%)</td><td class=\"num\">{{ \"%.2f\"|format(invoice.tax) }}</td></tr>\n  <tr class=\"sum total\"><td colspan=\"3\">Total</td><td class=\"num\">{{ \"%.2f\"|format(invoice.total) }}</td></tr>\n</table>\n<div class=\"actions\">\n  <form method=\"post\" action=\"{{ url_for('invoice_status', invoice_id=invoice.id) }}\">\n    <input type=\"hidden\" name=\"status\" value=\"paid\">\n    <button>Mark as paid</button>\n  </form>\n  <form method=\"post\" action=\"{{ url_for('invoice_delete', invoice_id=invoice.id) }}\">\n    <button class=\"danger\">Delete</button>\n  </form>\n</div>\n{% endblock %}\n"
+  },
+  {
+   "type": "browser",
+   "url": "http://127.0.0.1:5000/invoices",
+   "wait": 6
+  },
+  {
+   "type": "write",
+   "path": "templates/invoices.html",
+   "content": "{% extends \"base.html\" %}\n{% block title %}Invoices{% endblock %}\n{% block content %}\n<h1>Invoices</h1>\n<p class=\"filters\">\n  <a href=\"{{ url_for('invoices') }}\">All</a>\n  <a href=\"{{ url_for('invoices', status='sent') }}\">Sent</a>\n  <a href=\"{{ url_for('invoices', status='paid') }}\">Paid</a>\n  <a href=\"{{ url_for('invoices', status='overdue') }}\">Overdue</a>\n</p>\n{% include \"_invoice_table.html\" %}\n<p><a href=\"{{ url_for('index') }}\">Back to dashboard</a></p>\n{% endblock %}\n"
+  },
+  {
+   "type": "browser",
+   "refresh": true,
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "static/style.css",
+   "content": "* { box-sizing: border-box; }\nbody { margin: 0; font-family: system-ui, sans-serif; background: #f5f6f8; color: #1f2933; }\nnav { display: flex; gap: 1.2rem; align-items: center; padding: 0.8rem 2rem; background: #1f2933; }\nnav a { color: #e4e7eb; text-decoration: none; }\nnav .brand { font-weight: 700; margin-right: auto; color: #fff; }\nmain { max-width: 860px; margin: 2rem auto; padding: 0 1rem; }\nh1 { margin-top: 0; }\ntable { width: 100%; border-collapse: collapse; background: #fff; border-radius: 6px; overflow: hidden; }\nth, td { padding: 0.6rem 0.8rem; text-align: left; border-bottom: 1px solid #e4e7eb; }\nth { background: #eef0f3; font-size: 0.8rem; text-transform: uppercase; }\n.num { text-align: right; }\n.button, button { background: #2f6fed; color: #fff; border: 0; padding: 0.5rem 0.9rem; border-radius: 5px; cursor: pointer; text-decoration: none; }\nbutton.danger { background: #d64545; }\nbutton.link { background: none; color: #d64545; padding: 0; }\n.flash { background: #fff4d6; padding: 0.6rem 0.9rem; border-radius: 5px; }\n.empty { color: #7b8794; }\n.badge { padding: 0.15rem 0.5rem; border-radius: 99px; font-size: 0.75rem; background: #d9e2ec; }\n.badge.paid { background: #c6f6d5; }\n.badge.overdue { background: #fed7d7; }\nform label { display: block; margin-bottom: 0.8rem; }\ninput, select { display: block; padding: 0.45rem; width: 100%; max-width: 320px; }\n"
+  },
+  {
+   "type": "browser",
+   "refresh": true,
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "static/style.css",
+   "content": "* { box-sizing: border-box; }\nbody { margin: 0; font-family: system-ui, sans-serif; background: #f5f6f8; color: #1f2933; }\nnav { display: flex; gap: 1.2rem; align-items: center; padding: 0.8rem 2rem; background: #1f2933; }\nnav a { color: #e4e7eb; text-decoration: none; }\nnav .brand { font-weight: 700; margin-right: auto; color: #fff; }\nmain { max-width: 860px; margin: 2rem auto; padding: 0 1rem; }\nh1 { margin-top: 0; }\ntable { width: 100%; border-collapse: collapse; background: #fff; border-radius: 6px; overflow: hidden; }\nth, td { padding: 0.6rem 0.8rem; text-align: left; border-bottom: 1px solid #e4e7eb; }\nth { background: #eef0f3; font-size: 0.8rem; text-transform: uppercase; }\n.num { text-align: right; }\n.button, button { background: #2f6fed; color: #fff; border: 0; padding: 0.5rem 0.9rem; border-radius: 5px; cursor: pointer; text-decoration: none; }\nbutton.danger { background: #d64545; }\nbutton.link { background: none; color: #d64545; padding: 0; }\n.flash { background: #fff4d6; padding: 0.6rem 0.9rem; border-radius: 5px; }\n.empty { color: #7b8794; }\n.badge { padding: 0.15rem 0.5rem; border-radius: 99px; font-size: 0.75rem; background: #d9e2ec; }\n.badge.paid { background: #c6f6d5; }\n.badge.overdue { background: #fed7d7; }\nform label { display: block; margin-bottom: 0.8rem; }\ninput, select { display: block; padding: 0.45rem; width: 100%; max-width: 320px; }\n.cards { display: flex; gap: 1rem; margin-bottom: 1.5rem; }\n.card { flex: 1; background: #fff; padding: 1rem; border-radius: 6px; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08); }\n.card span { display: block; color: #7b8794; font-size: 0.85rem; }\n.card strong { font-size: 1.6rem; }\n.card.warn strong { color: #d64545; }\n.row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }\n.row input { max-width: none; }\n.actions { display: flex; gap: 0.6rem; margin-top: 1rem; }\n.sum td { font-weight: 600; background: #fafbfc; }\n.total td { font-size: 1.1rem; }\n"
+  },
+  {
+   "type": "browser",
+   "refresh": true,
+   "wait": 5
+  },
+  {
+   "type": "review",
+   "path": "templates/invoice_detail.html"
+  },
+  {
+   "type": "write",
+   "path": "test_app.py",
+   "content": "import os\nimport tempfile\nimport unittest\n\nimport db\nimport services\nfrom app import app\n\n\nclass RouteTests(unittest.TestCase):\n    def setUp(self):\n        fd, self.path = tempfile.mkstemp(suffix=\".db\")\n        os.close(fd)\n        db.DB_PATH = self.path\n        db.init_db()\n        app.config[\"TESTING\"] = True\n        self.http = app.test_client()\n\n    def tearDown(self):\n        os.remove(self.path)\n\n    def test_pages_load_when_empty(self):\n        for url in (\"/\", \"/clients\", \"/invoices\", \"/invoices/new\", \"/clients/new\"):\n            self.assertEqual(self.http.get(url).status_code, 200, url)\n\n    def test_create_client_and_invoice_flow(self):\n        self.http.post(\"/clients/new\", data={\"name\": \"Zuri\", \"email\": \"z@x.test\"})\n        self.assertEqual(len(services.list_clients()), 1)\n        resp = self.http.post(\n            \"/invoices/new\",\n            data={\n                \"client_id\": \"1\",\n                \"tax_rate\": \"10\",\n                \"description\": [\"Logo\", \"Banner\"],\n                \"qty\": [\"2\", \"1\"],\n                \"unit_price\": [\"100\", \"50\"],\n            },\n            follow_redirects=True,\n        )\n        self.assertEqual(resp.status_code, 200)\n        self.assertIn(b\"INV-0001\", resp.data)\n        self.assertIn(b\"275.00\", resp.data)\n\n    def test_mark_paid(self):\n        cid = services.add_client(\"Zuri\")\n        items = [{\"description\": \"x\", \"qty\": 1, \"unit_price\": 10}]\n        iid = services.create_invoice(cid, \"2026-01-01\", \"2026-01-15\", items)\n        self.http.post(f\"/invoices/{iid}/status\", data={\"status\": \"paid\"})\n        self.assertEqual(services.get_invoice(iid)[\"status\"], \"paid\")\n\n    def test_missing_invoice_404(self):\n        self.assertEqual(self.http.get(\"/invoices/99\").status_code, 404)\n\n    def test_summary_api(self):\n        data = self.http.get(\"/api/summary\").get_json()\n        self.assertEqual(data[\"outstanding\"], 0)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 10
+  },
+  {
+   "type": "review",
+   "path": "app.py"
+  },
+  {
+   "type": "write",
+   "path": "README.md",
+   "content": "# InvoiceDesk\n\nA small Flask + SQLite app for tracking clients and invoices.\n\n    pip install -r requirements.txt\n    python seed.py      # optional demo data\n    python app.py       # http://127.0.0.1:5000\n    python -m unittest -v\n"
+  },
+  {
+   "type": "browser",
+   "url": "http://127.0.0.1:5000/invoices/1",
+   "wait": 6
+  }
+ ]
+}

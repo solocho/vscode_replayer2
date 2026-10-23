@@ -1,0 +1,121 @@
+{
+ "name": "ChatRoom - multi-user TCP chat with threads",
+ "folder": "chatroom",
+ "steps": [
+  {
+   "type": "write",
+   "path": "chat/__init__.py",
+   "content": "\"\"\"A tiny TCP chat room.\"\"\"\n"
+  },
+  {
+   "type": "write",
+   "path": "chat/protocol.py",
+   "content": "import json\n\nENCODING = \"utf-8\"\n\n\ndef encode(kind, **fields):\n    \"\"\"One JSON object per line, ready to send over a socket.\"\"\"\n    return (json.dumps({\"type\": kind, **fields}) + \"\\n\").encode(ENCODING)\n\n\ndef decode(line):\n    data = json.loads(line.decode(ENCODING))\n    if not isinstance(data, dict) or \"type\" not in data:\n        raise ValueError(\"message needs a type\")\n    return data\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/__init__.py",
+   "content": "\"\"\"Tests for the chat room.\"\"\"\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_protocol.py",
+   "content": "import unittest\n\nfrom chat.protocol import decode, encode\n\n\nclass ProtocolTests(unittest.TestCase):\n    def test_round_trip(self):\n        data = encode(\"say\", nick=\"ana\", text=\"h\u00e9llo\")\n        self.assertTrue(data.endswith(b\"\\n\"))\n        self.assertEqual(decode(data), {\"type\": \"say\", \"nick\": \"ana\", \"text\": \"h\u00e9llo\"})\n\n    def test_rejects_non_json(self):\n        with self.assertRaises(ValueError):\n            decode(b\"nope\\n\")\n\n    def test_requires_type(self):\n        with self.assertRaises(ValueError):\n            decode(b'{\"text\": \"hi\"}\\n')\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "chat/server.py",
+   "content": "import socket\nimport threading\n\nfrom .protocol import decode, encode\n\n\nclass ChatServer:\n    def __init__(self, host=\"127.0.0.1\", port=0):\n        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n        self.sock.bind((host, port))\n        self.sock.listen()\n        self.address = self.sock.getsockname()\n        self.clients = {}            # nickname -> socket\n        self.lock = threading.Lock()\n        self.running = False\n\n    def start(self):\n        self.running = True\n        threading.Thread(target=self._accept_loop, daemon=True).start()\n        return self.address\n\n    def stop(self):\n        self.running = False\n        with self.lock:\n            for conn in list(self.clients.values()):\n                self._close(conn)\n            self.clients.clear()\n        self.sock.close()\n\n    def nicknames(self):\n        with self.lock:\n            return sorted(self.clients)\n\n    def broadcast(self, kind, **fields):\n        data = encode(kind, **fields)\n        with self.lock:\n            targets = list(self.clients.values())\n        for conn in targets:\n            try:\n                conn.sendall(data)\n            except OSError:\n                pass\n\n    def _accept_loop(self):\n        while self.running:\n            try:\n                conn, _ = self.sock.accept()\n            except OSError:\n                break\n            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()\n\n    def _serve(self, conn):\n        reader = conn.makefile(\"rb\")\n        nick = None\n        try:\n            for line in reader:\n                try:\n                    msg = decode(line)\n                except ValueError:\n                    self._send(conn, \"error\", text=\"bad message\")\n                    continue\n                kind = msg[\"type\"]\n                if kind == \"join\" and nick is None:\n                    nick = self._join(conn, str(msg.get(\"nick\", \"\")).strip())\n                elif nick is None:\n                    self._send(conn, \"error\", text=\"join first\")\n                elif kind == \"say\":\n                    self.broadcast(\"say\", nick=nick, text=str(msg.get(\"text\", \"\"))[:500])\n                elif kind == \"who\":\n                    self._send(conn, \"who\", nicks=self.nicknames())\n                elif kind == \"quit\":\n                    break\n        except OSError:\n            pass\n        finally:\n            self._leave(conn, nick)\n\n    def _join(self, conn, nick):\n        with self.lock:\n            taken = not nick or nick in self.clients\n            if not taken:\n                self.clients[nick] = conn\n        if taken:\n            self._send(conn, \"error\", text=\"nickname unavailable\")\n            return None\n        self._send(conn, \"welcome\", nick=nick)\n        self.broadcast(\"notice\", text=f\"{nick} joined\")\n        return nick\n\n    def _leave(self, conn, nick):\n        if nick:\n            self.broadcast(\"notice\", text=f\"{nick} left\")\n        self._close(conn)\n\n    def _send(self, conn, kind, **fields):\n        try:\n            conn.sendall(encode(kind, **fields))\n        except OSError:\n            pass\n\n    @staticmethod\n    def _close(conn):\n        try:\n            conn.close()\n        except OSError:\n            pass\n"
+  },
+  {
+   "type": "write",
+   "path": "chat/client.py",
+   "content": "import queue\nimport socket\nimport threading\n\nfrom .protocol import decode, encode\n\n\nclass ChatClient:\n    def __init__(self, host, port, nick, timeout=3):\n        self.nick = nick\n        self.sock = socket.create_connection((host, port), timeout=timeout)\n        self.sock.settimeout(None)\n        self.inbox = queue.Queue()\n        threading.Thread(target=self._read_loop, daemon=True).start()\n        self._send(\"join\", nick=nick)\n\n    def _send(self, kind, **fields):\n        self.sock.sendall(encode(kind, **fields))\n\n    def say(self, text):\n        self._send(\"say\", text=text)\n\n    def who(self):\n        self._send(\"who\")\n\n    def quit(self):\n        try:\n            self._send(\"quit\")\n        except OSError:\n            pass\n        self.sock.close()\n\n    def _read_loop(self):\n        try:\n            for line in self.sock.makefile(\"rb\"):\n                self.inbox.put(decode(line))\n        except (OSError, ValueError):\n            pass\n        self.inbox.put({\"type\": \"closed\"})\n\n    def next_message(self, timeout=2):\n        try:\n            return self.inbox.get(timeout=timeout)\n        except queue.Empty:\n            return None\n\n    def wait_for(self, kind, timeout=2):\n        \"\"\"Skip messages until one of the given type arrives (None on timeout).\"\"\"\n        while True:\n            msg = self.next_message(timeout)\n            if msg is None:\n                return None\n            if msg[\"type\"] == kind:\n                return msg\n            if msg[\"type\"] == \"closed\":\n                return None\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_server.py",
+   "content": "import socket\nimport time\nimport unittest\n\nfrom chat.client import ChatClient\nfrom chat.protocol import decode, encode\nfrom chat.server import ChatServer\n\n\ndef wait_until(check, timeout=2.0):\n    end = time.time() + timeout\n    while time.time() < end:\n        if check():\n            return True\n        time.sleep(0.02)\n    return False\n\n\nclass ServerTests(unittest.TestCase):\n    def setUp(self):\n        self.server = ChatServer()\n        self.host, self.port = self.server.start()\n        self.clients = []\n\n    def tearDown(self):\n        for client in self.clients:\n            client.quit()\n        self.server.stop()\n\n    def connect(self, nick):\n        client = ChatClient(self.host, self.port, nick)\n        self.clients.append(client)\n        return client\n\n    def test_welcome_registers_nickname(self):\n        ana = self.connect(\"ana\")\n        self.assertEqual(ana.wait_for(\"welcome\")[\"nick\"], \"ana\")\n        self.assertTrue(wait_until(lambda: self.server.nicknames() == [\"ana\"]))\n\n    def test_message_reaches_everyone(self):\n        ana, ben = self.connect(\"ana\"), self.connect(\"ben\")\n        ana.wait_for(\"welcome\")\n        ben.wait_for(\"welcome\")\n        ana.say(\"hello\")\n        for client in (ana, ben):\n            msg = client.wait_for(\"say\")\n            self.assertEqual((msg[\"nick\"], msg[\"text\"]), (\"ana\", \"hello\"))\n\n    def test_duplicate_nick_rejected(self):\n        self.connect(\"ana\").wait_for(\"welcome\")\n        twin = self.connect(\"ana\")\n        self.assertEqual(twin.wait_for(\"error\")[\"text\"], \"nickname unavailable\")\n\n    def test_must_join_first(self):\n        raw = socket.create_connection((self.host, self.port))\n        raw.sendall(encode(\"say\", text=\"hi\"))\n        reply = decode(raw.makefile(\"rb\").readline())\n        self.assertEqual(reply[\"text\"], \"join first\")\n        raw.close()\n\n    def test_who_lists_everyone(self):\n        ana, ben = self.connect(\"ana\"), self.connect(\"ben\")\n        ana.wait_for(\"welcome\")\n        ben.wait_for(\"welcome\")\n        wait_until(lambda: len(self.server.nicknames()) == 2)\n        ana.who()\n        self.assertEqual(ana.wait_for(\"who\")[\"nicks\"], [\"ana\", \"ben\"])\n\n    def test_leaving_removes_nickname(self):\n        ana, ben = self.connect(\"ana\"), self.connect(\"ben\")\n        ana.wait_for(\"welcome\")\n        ben.wait_for(\"welcome\")\n        ben.quit()\n        self.assertTrue(wait_until(lambda: self.server.nicknames() == [\"ana\"]))\n\n    def test_long_messages_are_trimmed(self):\n        ana = self.connect(\"ana\")\n        ana.wait_for(\"welcome\")\n        ana.say(\"x\" * 2000)\n        self.assertEqual(len(ana.wait_for(\"say\")[\"text\"]), 500)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 9
+  },
+  {
+   "type": "pause",
+   "seconds": 6
+  },
+  {
+   "type": "write",
+   "path": "chat/server.py",
+   "content": "import socket\nimport threading\n\nfrom .protocol import decode, encode\n\n\nclass ChatServer:\n    def __init__(self, host=\"127.0.0.1\", port=0):\n        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n        self.sock.bind((host, port))\n        self.sock.listen()\n        self.address = self.sock.getsockname()\n        self.clients = {}            # nickname -> socket\n        self.lock = threading.Lock()\n        self.running = False\n\n    def start(self):\n        self.running = True\n        threading.Thread(target=self._accept_loop, daemon=True).start()\n        return self.address\n\n    def stop(self):\n        self.running = False\n        with self.lock:\n            for conn in list(self.clients.values()):\n                self._close(conn)\n            self.clients.clear()\n        self.sock.close()\n\n    def nicknames(self):\n        with self.lock:\n            return sorted(self.clients)\n\n    def broadcast(self, kind, **fields):\n        data = encode(kind, **fields)\n        with self.lock:\n            targets = list(self.clients.values())\n        for conn in targets:\n            try:\n                conn.sendall(data)\n            except OSError:\n                pass\n\n    def _accept_loop(self):\n        while self.running:\n            try:\n                conn, _ = self.sock.accept()\n            except OSError:\n                break\n            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()\n\n    def _serve(self, conn):\n        reader = conn.makefile(\"rb\")\n        nick = None\n        try:\n            for line in reader:\n                try:\n                    msg = decode(line)\n                except ValueError:\n                    self._send(conn, \"error\", text=\"bad message\")\n                    continue\n                kind = msg[\"type\"]\n                if kind == \"join\" and nick is None:\n                    nick = self._join(conn, str(msg.get(\"nick\", \"\")).strip())\n                elif nick is None:\n                    self._send(conn, \"error\", text=\"join first\")\n                elif kind == \"say\":\n                    self.broadcast(\"say\", nick=nick, text=str(msg.get(\"text\", \"\"))[:500])\n                elif kind == \"who\":\n                    self._send(conn, \"who\", nicks=self.nicknames())\n                elif kind == \"quit\":\n                    break\n        except OSError:\n            pass\n        finally:\n            self._leave(conn, nick)\n\n    def _join(self, conn, nick):\n        with self.lock:\n            taken = not nick or nick in self.clients\n            if not taken:\n                self.clients[nick] = conn\n        if taken:\n            self._send(conn, \"error\", text=\"nickname unavailable\")\n            return None\n        self._send(conn, \"welcome\", nick=nick)\n        self.broadcast(\"notice\", text=f\"{nick} joined\")\n        return nick\n\n    def _leave(self, conn, nick):\n        if nick:\n            with self.lock:\n                self.clients.pop(nick, None)\n            self.broadcast(\"notice\", text=f\"{nick} left\")\n        self._close(conn)\n\n    def _send(self, conn, kind, **fields):\n        try:\n            conn.sendall(encode(kind, **fields))\n        except OSError:\n            pass\n\n    @staticmethod\n    def _close(conn):\n        try:\n            conn.close()\n        except OSError:\n            pass\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 6
+  },
+  {
+   "type": "review",
+   "path": "chat/server.py"
+  },
+  {
+   "type": "write",
+   "path": "demo.py",
+   "content": "from chat.client import ChatClient\nfrom chat.server import ChatServer\n\n\ndef show(who, msg):\n    if msg[\"type\"] == \"say\":\n        print(f\"[{who} sees] <{msg['nick']}> {msg['text']}\")\n    elif msg[\"type\"] == \"who\":\n        print(f\"[{who} sees] online: {', '.join(msg['nicks'])}\")\n    elif msg[\"type\"] == \"notice\":\n        print(f\"[{who} sees] * {msg['text']}\")\n\n\ndef drain(who, client):\n    while True:\n        msg = client.next_message(timeout=0.4)\n        if msg is None:\n            return\n        show(who, msg)\n\n\ndef main():\n    server = ChatServer()\n    host, port = server.start()\n    print(f\"server listening on {host}:{port}\")\n    ana = ChatClient(host, port, \"ana\")\n    ana.wait_for(\"welcome\")\n    ben = ChatClient(host, port, \"ben\")\n    ben.wait_for(\"welcome\")\n    ana.say(\"hi ben!\")\n    ben.say(\"hey ana, this is running over real sockets\")\n    ana.who()\n    drain(\"ana\", ana)\n    drain(\"ben\", ben)\n    ben.quit()\n    ana.quit()\n    server.stop()\n    print(\"done\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} demo.py",
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "chat/__main__.py",
+   "content": "import argparse\nimport threading\n\nfrom .client import ChatClient\nfrom .server import ChatServer\n\n\ndef serve(args):\n    server = ChatServer(args.host, args.port)\n    host, port = server.start()\n    print(f\"listening on {host}:{port} (Ctrl+C to stop)\")\n    try:\n        threading.Event().wait()\n    except KeyboardInterrupt:\n        server.stop()\n\n\ndef show_messages(client):\n    while True:\n        msg = client.next_message(timeout=None)\n        if msg[\"type\"] == \"closed\":\n            print(\"disconnected\")\n            break\n        if msg[\"type\"] == \"say\":\n            print(f\"<{msg['nick']}> {msg['text']}\")\n        elif msg[\"type\"] == \"who\":\n            print(\"online:\", \", \".join(msg[\"nicks\"]))\n        else:\n            print(\"*\", msg.get(\"text\", msg[\"type\"]))\n\n\ndef join(args):\n    client = ChatClient(args.host, args.port, args.nick)\n    threading.Thread(target=show_messages, args=(client,), daemon=True).start()\n    try:\n        for line in iter(input, \"/quit\"):\n            if line == \"/who\":\n                client.who()\n            else:\n                client.say(line)\n    except (EOFError, KeyboardInterrupt):\n        pass\n    client.quit()\n\n\ndef main():\n    parser = argparse.ArgumentParser(prog=\"chat\")\n    parser.add_argument(\"--host\", default=\"127.0.0.1\")\n    parser.add_argument(\"--port\", type=int, default=9000)\n    sub = parser.add_subparsers(dest=\"mode\", required=True)\n    sub.add_parser(\"serve\")\n    joiner = sub.add_parser(\"join\")\n    joiner.add_argument(\"nick\")\n    args = parser.parse_args()\n    if args.mode == \"serve\":\n        serve(args)\n    else:\n        join(args)\n\n\nmain()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m chat serve --port 9000",
+   "wait": 4,
+   "new_terminal": true
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m chat join ana --port 9000",
+   "wait": 4,
+   "new_terminal": true
+  },
+  {
+   "type": "run",
+   "command": "hello from the real terminal",
+   "wait": 3
+  },
+  {
+   "type": "run",
+   "command": "/who",
+   "wait": 3
+  },
+  {
+   "type": "run",
+   "command": "/quit",
+   "wait": 3
+  },
+  {
+   "type": "write",
+   "path": "README.md",
+   "content": "# Chat room\n\nA small multi-user chat over TCP sockets, one JSON message per line.\n\n    python demo.py                      # server + two clients in one script\n    python -m chat serve --port 9000    # terminal 1\n    python -m chat join ana --port 9000 # terminal 2 (/who, /quit)\n    python -m unittest -v\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 6
+  }
+ ]
+}

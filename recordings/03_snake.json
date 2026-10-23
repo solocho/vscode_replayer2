@@ -1,0 +1,122 @@
+{
+ "name": "Snake - tkinter game with high scores and an autopilot",
+ "folder": "snake",
+ "steps": [
+  {
+   "type": "write",
+   "path": "snake/__init__.py",
+   "content": "\"\"\"Snake game package.\"\"\"\n"
+  },
+  {
+   "type": "write",
+   "path": "snake/config.py",
+   "content": "GRID_W = 24\nGRID_H = 18\nCELL = 24\nSTART_DELAY_MS = 150\nMIN_DELAY_MS = 60\nSPEEDUP_EVERY = 4        # foods eaten per speed-up\nSPEEDUP_MS = 10\nHIGHSCORE_FILE = \"highscores.json\"\n"
+  },
+  {
+   "type": "write",
+   "path": "snake/game.py",
+   "content": "import random\nfrom collections import deque\n\nfrom . import config\n\nUP, DOWN, LEFT, RIGHT = (0, -1), (0, 1), (-1, 0), (1, 0)\nOPPOSITE = {UP: DOWN, DOWN: UP, LEFT: RIGHT, RIGHT: LEFT}\n\n\nclass Game:\n    def __init__(self, width=config.GRID_W, height=config.GRID_H, rng=None):\n        self.width = width\n        self.height = height\n        self.rng = rng or random.Random()\n        mid = (width // 2, height // 2)\n        self.body = deque([mid, (mid[0] - 1, mid[1]), (mid[0] - 2, mid[1])])\n        self.direction = RIGHT\n        self._pending = RIGHT\n        self.score = 0\n        self.alive = True\n        self.food = self._place_food()\n\n    @property\n    def head(self):\n        return self.body[0]\n\n    @property\n    def delay_ms(self):\n        faster = (self.score // config.SPEEDUP_EVERY) * config.SPEEDUP_MS\n        return max(config.MIN_DELAY_MS, config.START_DELAY_MS - faster)\n\n    def _place_food(self):\n        free = [\n            (x, y)\n            for x in range(self.width)\n            for y in range(self.height)\n            if (x, y) not in self.body\n        ]\n        return self.rng.choice(free) if free else None\n\n    def step(self):\n        if not self.alive:\n            return\n        self.direction = self._pending\n        dx, dy = self.direction\n        new_head = (self.head[0] + dx, self.head[1] + dy)\n        grows = new_head == self.food\n        tail = self.body[-1]\n        hits_wall = not (0 <= new_head[0] < self.width and 0 <= new_head[1] < self.height)\n        hits_self = new_head in self.body and not (new_head == tail and not grows)\n        if hits_wall or hits_self:\n            self.alive = False\n            return\n        self.body.appendleft(new_head)\n        if grows:\n            self.score += 1\n            self.food = self._place_food()\n        else:\n            self.body.pop()\n\n    def turn(self, direction):\n        if direction != OPPOSITE[self._pending]:\n            self._pending = direction\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/__init__.py",
+   "content": "\"\"\"Tests for the snake game.\"\"\"\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_game.py",
+   "content": "import random\nimport unittest\nfrom collections import deque\n\nfrom snake import config\nfrom snake.game import DOWN, LEFT, RIGHT, UP, Game\n\n\nclass GameTests(unittest.TestCase):\n    def make(self):\n        return Game(10, 10, rng=random.Random(1))\n\n    def test_moves_one_cell_per_step(self):\n        game = self.make()\n        start = game.head\n        game.step()\n        self.assertEqual(game.head, (start[0] + 1, start[1]))\n        self.assertEqual(len(game.body), 3)\n\n    def test_eating_grows_and_scores(self):\n        game = self.make()\n        game.food = (game.head[0] + 1, game.head[1])\n        game.step()\n        self.assertEqual(game.score, 1)\n        self.assertEqual(len(game.body), 4)\n        self.assertNotIn(game.food, game.body)\n\n    def test_cannot_reverse(self):\n        game = self.make()\n        game.turn(LEFT)\n        game.step()\n        self.assertEqual(game.direction, RIGHT)\n\n    def test_quick_double_turn_cannot_reverse(self):\n        game = self.make()\n        game.turn(UP)\n        game.turn(LEFT)\n        game.step()\n        self.assertTrue(game.alive)\n        self.assertEqual(game.direction, UP)\n\n    def test_wall_kills(self):\n        game = self.make()\n        for _ in range(10):\n            game.step()\n        self.assertFalse(game.alive)\n\n    def test_running_into_itself_kills(self):\n        game = self.make()\n        game.body = deque([(5, 5), (6, 5), (6, 4), (5, 4), (4, 4)])\n        game.direction = game._pending = LEFT\n        game.food = (0, 0)\n        game.turn(UP)\n        game.step()\n        self.assertFalse(game.alive)\n\n    def test_chasing_the_tail_is_allowed(self):\n        game = self.make()\n        game.body = deque([(5, 5), (6, 5), (6, 4), (5, 4)])\n        game.direction = game._pending = LEFT\n        game.food = (0, 0)\n        game.turn(UP)\n        game.step()\n        self.assertTrue(game.alive)\n\n    def test_speeds_up_but_has_a_floor(self):\n        game = self.make()\n        self.assertEqual(game.delay_ms, config.START_DELAY_MS)\n        game.score = config.SPEEDUP_EVERY * 2\n        self.assertEqual(game.delay_ms, config.START_DELAY_MS - 2 * config.SPEEDUP_MS)\n        game.score = 1000\n        self.assertEqual(game.delay_ms, config.MIN_DELAY_MS)\n\n    def test_dead_snake_stays_put(self):\n        game = self.make()\n        game.alive = False\n        before = list(game.body)\n        game.step()\n        self.assertEqual(list(game.body), before)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "pause",
+   "seconds": 6
+  },
+  {
+   "type": "write",
+   "path": "snake/game.py",
+   "content": "import random\nfrom collections import deque\n\nfrom . import config\n\nUP, DOWN, LEFT, RIGHT = (0, -1), (0, 1), (-1, 0), (1, 0)\nOPPOSITE = {UP: DOWN, DOWN: UP, LEFT: RIGHT, RIGHT: LEFT}\n\n\nclass Game:\n    def __init__(self, width=config.GRID_W, height=config.GRID_H, rng=None):\n        self.width = width\n        self.height = height\n        self.rng = rng or random.Random()\n        mid = (width // 2, height // 2)\n        self.body = deque([mid, (mid[0] - 1, mid[1]), (mid[0] - 2, mid[1])])\n        self.direction = RIGHT\n        self._pending = RIGHT\n        self.score = 0\n        self.alive = True\n        self.food = self._place_food()\n\n    @property\n    def head(self):\n        return self.body[0]\n\n    @property\n    def delay_ms(self):\n        faster = (self.score // config.SPEEDUP_EVERY) * config.SPEEDUP_MS\n        return max(config.MIN_DELAY_MS, config.START_DELAY_MS - faster)\n\n    def _place_food(self):\n        free = [\n            (x, y)\n            for x in range(self.width)\n            for y in range(self.height)\n            if (x, y) not in self.body\n        ]\n        return self.rng.choice(free) if free else None\n\n    def step(self):\n        if not self.alive:\n            return\n        self.direction = self._pending\n        dx, dy = self.direction\n        new_head = (self.head[0] + dx, self.head[1] + dy)\n        grows = new_head == self.food\n        tail = self.body[-1]\n        hits_wall = not (0 <= new_head[0] < self.width and 0 <= new_head[1] < self.height)\n        hits_self = new_head in self.body and not (new_head == tail and not grows)\n        if hits_wall or hits_self:\n            self.alive = False\n            return\n        self.body.appendleft(new_head)\n        if grows:\n            self.score += 1\n            self.food = self._place_food()\n        else:\n            self.body.pop()\n\n    def turn(self, direction):\n        if direction != OPPOSITE[self.direction]:\n            self._pending = direction\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "review",
+   "path": "snake/game.py"
+  },
+  {
+   "type": "write",
+   "path": "snake/highscores.py",
+   "content": "import json\n\nMAX_SCORES = 5\n\n\ndef load(path):\n    try:\n        with open(path) as handle:\n            data = json.load(handle)\n    except (OSError, ValueError):\n        return []\n    scores = [s for s in data if isinstance(s, int)]\n    return sorted(scores, reverse=True)[:MAX_SCORES]\n\n\ndef save(path, scores):\n    with open(path, \"w\") as handle:\n        json.dump(scores, handle)\n\n\ndef add_score(path, score):\n    scores = load(path)\n    scores.append(score)\n    scores = sorted(scores)[:MAX_SCORES]\n    save(path, scores)\n    return scores\n\n\ndef is_high_score(path, score):\n    scores = load(path)\n    return score > 0 and (len(scores) < MAX_SCORES or score > scores[-1])\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_highscores.py",
+   "content": "import os\nimport tempfile\nimport unittest\n\nfrom snake import highscores\n\n\nclass HighScoreTests(unittest.TestCase):\n    def setUp(self):\n        self.tmp = tempfile.TemporaryDirectory()\n        self.path = os.path.join(self.tmp.name, \"scores.json\")\n\n    def tearDown(self):\n        self.tmp.cleanup()\n\n    def test_missing_file_is_empty(self):\n        self.assertEqual(highscores.load(self.path), [])\n\n    def test_corrupt_file_is_empty(self):\n        with open(self.path, \"w\") as handle:\n            handle.write(\"{not json\")\n        self.assertEqual(highscores.load(self.path), [])\n\n    def test_keeps_top_five_descending(self):\n        for score in (3, 9, 1, 7, 5, 8, 2):\n            scores = highscores.add_score(self.path, score)\n        self.assertEqual(scores, [9, 8, 7, 5, 3])\n        self.assertEqual(highscores.load(self.path), [9, 8, 7, 5, 3])\n\n    def test_is_high_score(self):\n        self.assertFalse(highscores.is_high_score(self.path, 0))\n        self.assertTrue(highscores.is_high_score(self.path, 1))\n        for score in (5, 6, 7, 8, 9):\n            highscores.add_score(self.path, score)\n        self.assertFalse(highscores.is_high_score(self.path, 4))\n        self.assertTrue(highscores.is_high_score(self.path, 6))\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "pause",
+   "seconds": 5
+  },
+  {
+   "type": "write",
+   "path": "snake/highscores.py",
+   "content": "import json\n\nMAX_SCORES = 5\n\n\ndef load(path):\n    try:\n        with open(path) as handle:\n            data = json.load(handle)\n    except (OSError, ValueError):\n        return []\n    scores = [s for s in data if isinstance(s, int)]\n    return sorted(scores, reverse=True)[:MAX_SCORES]\n\n\ndef save(path, scores):\n    with open(path, \"w\") as handle:\n        json.dump(scores, handle)\n\n\ndef add_score(path, score):\n    scores = load(path)\n    scores.append(score)\n    scores = sorted(scores, reverse=True)[:MAX_SCORES]\n    save(path, scores)\n    return scores\n\n\ndef is_high_score(path, score):\n    scores = load(path)\n    return score > 0 and (len(scores) < MAX_SCORES or score > scores[-1])\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "snake/ai.py",
+   "content": "from .game import DOWN, LEFT, OPPOSITE, RIGHT, UP\n\n\ndef is_safe(game, direction):\n    x = game.head[0] + direction[0]\n    y = game.head[1] + direction[1]\n    if not (0 <= x < game.width and 0 <= y < game.height):\n        return False\n    return (x, y) not in list(game.body)[:-1]\n\n\ndef choose(game):\n    \"\"\"Pick a safe direction that moves closer to the food.\"\"\"\n    options = [\n        d for d in (UP, DOWN, LEFT, RIGHT)\n        if d != OPPOSITE[game.direction] and is_safe(game, d)\n    ]\n    if not options or game.food is None:\n        return game.direction\n    fx, fy = game.food\n\n    def distance(d):\n        return abs(game.head[0] + d[0] - fx) + abs(game.head[1] + d[1] - fy)\n\n    return min(options, key=distance)\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_ai.py",
+   "content": "import random\nimport unittest\nfrom collections import deque\n\nfrom snake import ai\nfrom snake.game import DOWN, RIGHT, UP, Game\n\n\nclass AiTests(unittest.TestCase):\n    def test_does_not_drive_into_a_wall(self):\n        game = Game(10, 10, rng=random.Random(2))\n        game.body = deque([(9, 5), (8, 5), (7, 5)])\n        game.food = (0, 0)\n        choice = ai.choose(game)\n        self.assertIn(choice, (UP, DOWN))\n\n    def test_heads_for_the_food(self):\n        game = Game(10, 10, rng=random.Random(2))\n        game.food = (game.head[0] + 3, game.head[1])\n        self.assertEqual(ai.choose(game), RIGHT)\n\n    def test_autopilot_survives_a_while(self):\n        game = Game(12, 12, rng=random.Random(3))\n        for _ in range(60):\n            game.turn(ai.choose(game))\n            game.step()\n        self.assertTrue(game.alive)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "snake/ui.py",
+   "content": "import tkinter as tk\n\nfrom . import ai, config, highscores\nfrom .game import DOWN, LEFT, RIGHT, UP, Game\n\nKEYS = {\n    \"Up\": UP, \"Down\": DOWN, \"Left\": LEFT, \"Right\": RIGHT,\n    \"w\": UP, \"s\": DOWN, \"a\": LEFT, \"d\": RIGHT,\n}\nBG, BODY, HEAD, FOOD = \"#1b1f23\", \"#4caf50\", \"#a5d6a7\", \"#ef5350\"\n\n\nclass SnakeApp:\n    def __init__(self, root, demo=False, scores_path=config.HIGHSCORE_FILE):\n        self.root = root\n        self.demo = demo\n        self.scores_path = scores_path\n        self.paused = False\n        root.title(\"Snake\")\n        self.label = tk.Label(root, font=(\"Helvetica\", 14))\n        self.label.pack()\n        self.canvas = tk.Canvas(\n            root,\n            width=config.GRID_W * config.CELL,\n            height=config.GRID_H * config.CELL,\n            bg=BG,\n            highlightthickness=0,\n        )\n        self.canvas.pack()\n        root.bind(\"<Key>\", self.on_key)\n        self.new_game()\n        self.tick()\n        if demo:\n            root.after(12000, root.destroy)\n\n    def new_game(self):\n        self.game = Game()\n        self.update_label()\n\n    def update_label(self):\n        best = highscores.load(self.scores_path)\n        top = best[0] if best else 0\n        self.label.config(text=f\"Score: {self.game.score}    Best: {top}\")\n\n    def on_key(self, event):\n        if event.keysym in KEYS and not self.demo:\n            self.game.turn(KEYS[event.keysym])\n        elif event.keysym == \"space\":\n            if self.game.alive:\n                self.paused = not self.paused\n            else:\n                self.new_game()\n        elif event.keysym == \"Escape\":\n            self.root.destroy()\n\n    def tick(self):\n        game = self.game\n        if self.demo and game.alive:\n            game.turn(ai.choose(game))\n        if game.alive and not self.paused:\n            game.step()\n            self.update_label()\n            if not game.alive:\n                if self.demo:\n                    self.new_game()\n                else:\n                    highscores.add_score(self.scores_path, game.score)\n        self.draw()\n        self.root.after(self.game.delay_ms, self.tick)\n\n    def cell(self, pos, color):\n        c = config.CELL\n        x, y = pos\n        self.canvas.create_rectangle(\n            x * c + 1, y * c + 1, (x + 1) * c - 1, (y + 1) * c - 1, fill=color, outline=\"\"\n        )\n\n    def draw(self):\n        self.canvas.delete(\"all\")\n        game = self.game\n        if game.food:\n            self.cell(game.food, FOOD)\n        for pos in list(game.body)[1:]:\n            self.cell(pos, BODY)\n        self.cell(game.head, HEAD)\n        message = None\n        if not game.alive:\n            message = \"Game over - press space\"\n        elif self.paused:\n            message = \"Paused\"\n        if message:\n            self.canvas.create_text(\n                config.GRID_W * config.CELL / 2, config.GRID_H * config.CELL / 2,\n                text=message, fill=\"white\", font=(\"Helvetica\", 20, \"bold\"),\n            )\n"
+  },
+  {
+   "type": "write",
+   "path": "play.py",
+   "content": "import argparse\nimport tkinter as tk\n\nfrom snake.ui import SnakeApp\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"Snake\")\n    parser.add_argument(\"--demo\", action=\"store_true\",\n                        help=\"let the computer play for a few seconds\")\n    args = parser.parse_args()\n    root = tk.Tk()\n    SnakeApp(root, demo=args.demo)\n    root.mainloop()\n\n\nif __name__ == \"__main__\":\n    main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} play.py --demo",
+   "wait": 16
+  },
+  {
+   "type": "review",
+   "path": "snake/ui.py"
+  },
+  {
+   "type": "write",
+   "path": "README.md",
+   "content": "# Snake\n\nClassic Snake with a tkinter window, high scores and a computer-played demo.\n\n    python play.py          # arrows or WASD, space = pause / restart, Esc = quit\n    python play.py --demo   # watch the autopilot for 12 seconds\n    python -m unittest -v\n"
+  }
+ ]
+}

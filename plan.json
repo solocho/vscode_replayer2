@@ -1,0 +1,9 @@
+{
+ "projects": [
+  "recordings/01_loglens.json",
+  "recordings/02_mdlite.json",
+  "recordings/03_snake.json",
+  "recordings/04_chatroom.json",
+  "recordings/05_invoicedesk.json"
+ ]
+}

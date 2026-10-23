@@ -1,0 +1,118 @@
+{
+ "name": "MarkdownLite - Markdown to HTML converter",
+ "folder": "mdlite",
+ "steps": [
+  {
+   "type": "write",
+   "path": "mdlite/__init__.py",
+   "content": "\"\"\"A small Markdown to HTML converter.\"\"\"\n"
+  },
+  {
+   "type": "write",
+   "path": "mdlite/inline.py",
+   "content": "import html\nimport re\n\nCODE = re.compile(r\"`([^`]+)`\")\nBOLD = re.compile(r\"\\*\\*(.+?)\\*\\*\")\nITALIC = re.compile(r\"\\*(.+?)\\*\")\nLINK = re.compile(r\"\\[([^\\]]+)\\]\\(([^)\\s]+)\\)\")\n\n\ndef render_inline(text):\n    \"\"\"Escape HTML, then apply code, bold, italic and links.\"\"\"\n    stash = []\n\n    def keep_code(match):\n        stash.append(f\"<code>{match.group(1)}</code>\")\n        return f\"\\x00{len(stash) - 1}\\x00\"\n\n    text = html.escape(text, quote=False)\n    text = CODE.sub(keep_code, text)\n    text = ITALIC.sub(r\"<em>\\1</em>\", text)\n    text = BOLD.sub(r\"<strong>\\1</strong>\", text)\n    text = LINK.sub(r'<a href=\"\\2\">\\1</a>', text)\n    for index, snippet in enumerate(stash):\n        text = text.replace(f\"\\x00{index}\\x00\", snippet)\n    return text\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/__init__.py",
+   "content": "\"\"\"Tests for mdlite.\"\"\"\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_inline.py",
+   "content": "import unittest\n\nfrom mdlite.inline import render_inline\n\n\nclass InlineTests(unittest.TestCase):\n    def test_plain_text_is_escaped(self):\n        self.assertEqual(render_inline(\"a < b & c\"), \"a &lt; b &amp; c\")\n\n    def test_bold(self):\n        self.assertEqual(render_inline(\"**hi**\"), \"<strong>hi</strong>\")\n\n    def test_italic(self):\n        self.assertEqual(render_inline(\"*hi*\"), \"<em>hi</em>\")\n\n    def test_bold_and_italic_together(self):\n        self.assertEqual(\n            render_inline(\"**a** and *b*\"), \"<strong>a</strong> and <em>b</em>\"\n        )\n\n    def test_code_is_not_formatted_further(self):\n        self.assertEqual(render_inline(\"`*x*`\"), \"<code>*x*</code>\")\n\n    def test_link(self):\n        self.assertEqual(\n            render_inline(\"[py](https://python.org)\"), '<a href=\"https://python.org\">py</a>'\n        )\n\n    def test_html_in_text_cannot_inject(self):\n        self.assertEqual(render_inline(\"<script>\"), \"&lt;script&gt;\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "pause",
+   "seconds": 6
+  },
+  {
+   "type": "write",
+   "path": "mdlite/inline.py",
+   "content": "import html\nimport re\n\nCODE = re.compile(r\"`([^`]+)`\")\nBOLD = re.compile(r\"\\*\\*(.+?)\\*\\*\")\nITALIC = re.compile(r\"\\*(.+?)\\*\")\nLINK = re.compile(r\"\\[([^\\]]+)\\]\\(([^)\\s]+)\\)\")\n\n\ndef render_inline(text):\n    \"\"\"Escape HTML, then apply code, bold, italic and links.\"\"\"\n    stash = []\n\n    def keep_code(match):\n        stash.append(f\"<code>{match.group(1)}</code>\")\n        return f\"\\x00{len(stash) - 1}\\x00\"\n\n    text = html.escape(text, quote=False)\n    text = CODE.sub(keep_code, text)\n    text = BOLD.sub(r\"<strong>\\1</strong>\", text)\n    text = ITALIC.sub(r\"<em>\\1</em>\", text)\n    text = LINK.sub(r'<a href=\"\\2\">\\1</a>', text)\n    for index, snippet in enumerate(stash):\n        text = text.replace(f\"\\x00{index}\\x00\", snippet)\n    return text\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "mdlite/blocks.py",
+   "content": "import html\nimport re\n\nfrom .inline import render_inline\n\nHEADING = re.compile(r\"^(#{1,6})\\s+(.*)$\")\nRULE = re.compile(r\"^(-{3,}|\\*{3,})$\")\nBULLET = re.compile(r\"^[-*+]\\s+(.*)$\")\nNUMBERED = re.compile(r\"^\\d+[.)]\\s+(.*)$\")\n\n\ndef split_blocks(text):\n    \"\"\"Group lines into blocks. Fenced code stays whole; blank lines separate the rest.\"\"\"\n    blocks, current, in_fence = [], [], False\n    for line in text.replace(\"\\r\\n\", \"\\n\").split(\"\\n\"):\n        if in_fence:\n            current.append(line)\n            if line.startswith(\"```\"):\n                blocks.append(current)\n                current, in_fence = [], False\n        elif line.startswith(\"```\"):\n            if current:\n                blocks.append(current)\n            current, in_fence = [line], True\n        elif not line.strip():\n            if current:\n                blocks.append(current)\n                current = []\n        else:\n            current.append(line)\n    if current:\n        blocks.append(current)\n    return blocks\n\n\ndef render_blocks(text):\n    return \"\\n\".join(render_block(block) for block in split_blocks(text))\n\n\ndef render_block(lines):\n    first = lines[0]\n    if first.startswith(\"```\"):\n        return render_code(lines)\n    heading = HEADING.match(first)\n    if heading:\n        level = len(heading.group(1))\n        out = f\"<h{level}>{render_inline(heading.group(2))}</h{level}>\"\n        if len(lines) > 1:\n            out += \"\\n\" + render_block(lines[1:])\n        return out\n    if len(lines) == 1 and RULE.match(first):\n        return \"<hr>\"\n    if all(line.startswith(\">\") for line in lines):\n        inner = \"\\n\".join(line[1:].lstrip() for line in lines)\n        return f\"<blockquote>{render_blocks(inner)}</blockquote>\"\n    if all(BULLET.match(line) for line in lines):\n        return render_list(\"ul\", [BULLET.match(line).group(1) for line in lines])\n    if all(NUMBERED.match(line) for line in lines):\n        return render_list(\"ol\", [NUMBERED.match(line).group(1) for line in lines])\n    return \"<p>\" + render_inline(\" \".join(line.strip() for line in lines)) + \"</p>\"\n\n\ndef render_list(tag, items):\n    body = \"\\n\".join(f\"<li>{render_inline(item)}</li>\" for item in items)\n    return f\"<{tag}>\\n{body}\\n</{tag}>\"\n\n\ndef render_code(lines):\n    closed = len(lines) > 1 and lines[-1].startswith(\"```\")\n    code = \"\\n\".join(lines[1:-1] if closed else lines[1:])\n    lang = lines[0][3:].strip()\n    attr = f' class=\"language-{html.escape(lang)}\"' if lang else \"\"\n    return f\"<pre><code{attr}>{code}</code></pre>\"\n"
+  },
+  {
+   "type": "write",
+   "path": "mdlite/render.py",
+   "content": "from .blocks import render_blocks\n\nPAGE = \"\"\"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>{title}</title>\n<style>\nbody {{ font-family: Georgia, serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; color: #222; }}\npre {{ background: #f3f3f3; padding: 0.8rem; overflow-x: auto; border-radius: 4px; }}\ncode {{ font-family: Consolas, monospace; background: #f3f3f3; padding: 0 0.2rem; }}\npre code {{ padding: 0; }}\nblockquote {{ border-left: 4px solid #ccc; margin-left: 0; padding-left: 1rem; color: #555; }}\n</style>\n</head>\n<body>\n{body}\n</body>\n</html>\n\"\"\"\n\n\ndef render(text):\n    return render_blocks(text)\n\n\ndef extract_title(text, default=\"Document\"):\n    for line in text.splitlines():\n        if line.startswith(\"# \"):\n            return line[2:].strip()\n    return default\n\n\ndef render_page(text, title=None):\n    return PAGE.format(title=title or extract_title(text), body=render(text))\n"
+  },
+  {
+   "type": "write",
+   "path": "convert.py",
+   "content": "import argparse\nfrom pathlib import Path\n\nfrom mdlite.render import extract_title, render_page\n\n\ndef main(argv=None):\n    parser = argparse.ArgumentParser(description=\"Convert Markdown to a standalone HTML page.\")\n    parser.add_argument(\"source\")\n    parser.add_argument(\"-o\", \"--output\")\n    args = parser.parse_args(argv)\n    source = Path(args.source)\n    output = Path(args.output) if args.output else source.with_suffix(\".html\")\n    text = source.read_text(encoding=\"utf-8\")\n    output.write_text(render_page(text, extract_title(text)), encoding=\"utf-8\")\n    print(f\"wrote {output}\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n"
+  },
+  {
+   "type": "write",
+   "path": "sample.md",
+   "content": "# MarkdownLite\n\nA tiny converter written in **plain Python**. It understands *emphasis*, `inline code`\nand [links](https://www.python.org).\n\n## What it supports\n\n- headings from `#` to `######`\n- bullet lists like this one\n- numbered lists\n- block quotes and code fences\n\n### Steps to use it\n\n1. Write some Markdown\n2. Run `python convert.py sample.md`\n3. Open the HTML file in a browser\n\n> Good tools are small enough to understand.\n> Then you can change them.\n\n---\n\nHere is a code sample with characters HTML cares about:\n\n```html\n<div class=\"card\">\n  <p>5 < 6 && 7 > 3</p>\n</div>\n```\n\nDone. Escaped text such as <b>this</b> is shown literally.\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} convert.py sample.md",
+   "wait": 3
+  },
+  {
+   "type": "browser",
+   "url": "{FOLDER_URI}/sample.html",
+   "wait": 6
+  },
+  {
+   "type": "pause",
+   "seconds": 5
+  },
+  {
+   "type": "review",
+   "path": "mdlite/blocks.py"
+  },
+  {
+   "type": "write",
+   "path": "mdlite/blocks.py",
+   "content": "import html\nimport re\n\nfrom .inline import render_inline\n\nHEADING = re.compile(r\"^(#{1,6})\\s+(.*)$\")\nRULE = re.compile(r\"^(-{3,}|\\*{3,})$\")\nBULLET = re.compile(r\"^[-*+]\\s+(.*)$\")\nNUMBERED = re.compile(r\"^\\d+[.)]\\s+(.*)$\")\n\n\ndef split_blocks(text):\n    \"\"\"Group lines into blocks. Fenced code stays whole; blank lines separate the rest.\"\"\"\n    blocks, current, in_fence = [], [], False\n    for line in text.replace(\"\\r\\n\", \"\\n\").split(\"\\n\"):\n        if in_fence:\n            current.append(line)\n            if line.startswith(\"```\"):\n                blocks.append(current)\n                current, in_fence = [], False\n        elif line.startswith(\"```\"):\n            if current:\n                blocks.append(current)\n            current, in_fence = [line], True\n        elif not line.strip():\n            if current:\n                blocks.append(current)\n                current = []\n        else:\n            current.append(line)\n    if current:\n        blocks.append(current)\n    return blocks\n\n\ndef render_blocks(text):\n    return \"\\n\".join(render_block(block) for block in split_blocks(text))\n\n\ndef render_block(lines):\n    first = lines[0]\n    if first.startswith(\"```\"):\n        return render_code(lines)\n    heading = HEADING.match(first)\n    if heading:\n        level = len(heading.group(1))\n        out = f\"<h{level}>{render_inline(heading.group(2))}</h{level}>\"\n        if len(lines) > 1:\n            out += \"\\n\" + render_block(lines[1:])\n        return out\n    if len(lines) == 1 and RULE.match(first):\n        return \"<hr>\"\n    if all(line.startswith(\">\") for line in lines):\n        inner = \"\\n\".join(line[1:].lstrip() for line in lines)\n        return f\"<blockquote>{render_blocks(inner)}</blockquote>\"\n    if all(BULLET.match(line) for line in lines):\n        return render_list(\"ul\", [BULLET.match(line).group(1) for line in lines])\n    if all(NUMBERED.match(line) for line in lines):\n        return render_list(\"ol\", [NUMBERED.match(line).group(1) for line in lines])\n    return \"<p>\" + render_inline(\" \".join(line.strip() for line in lines)) + \"</p>\"\n\n\ndef render_list(tag, items):\n    body = \"\\n\".join(f\"<li>{render_inline(item)}</li>\" for item in items)\n    return f\"<{tag}>\\n{body}\\n</{tag}>\"\n\n\ndef render_code(lines):\n    closed = len(lines) > 1 and lines[-1].startswith(\"```\")\n    code = \"\\n\".join(lines[1:-1] if closed else lines[1:])\n    lang = lines[0][3:].strip()\n    attr = f' class=\"language-{html.escape(lang)}\"' if lang else \"\"\n    return f\"<pre><code{attr}>{html.escape(code)}</code></pre>\"\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} convert.py sample.md",
+   "wait": 3
+  },
+  {
+   "type": "browser",
+   "refresh": true,
+   "wait": 5
+  },
+  {
+   "type": "write",
+   "path": "tests/test_blocks.py",
+   "content": "import unittest\n\nfrom mdlite.blocks import render_blocks, split_blocks\n\n\nclass BlockTests(unittest.TestCase):\n    def test_blank_lines_separate_blocks(self):\n        self.assertEqual(len(split_blocks(\"a\\nb\\n\\nc\")), 2)\n\n    def test_fence_keeps_blank_lines(self):\n        text = \"```\\none\\n\\ntwo\\n```\\nafter\"\n        self.assertEqual(len(split_blocks(text)), 2)\n\n    def test_headings(self):\n        self.assertEqual(render_blocks(\"# Title\"), \"<h1>Title</h1>\")\n        self.assertEqual(render_blocks(\"### Small\"), \"<h3>Small</h3>\")\n\n    def test_paragraph_joins_lines(self):\n        self.assertEqual(render_blocks(\"one\\ntwo\"), \"<p>one two</p>\")\n\n    def test_bullet_list(self):\n        self.assertEqual(\n            render_blocks(\"- a\\n- b\"), \"<ul>\\n<li>a</li>\\n<li>b</li>\\n</ul>\"\n        )\n\n    def test_numbered_list(self):\n        self.assertEqual(\n            render_blocks(\"1. a\\n2) b\"), \"<ol>\\n<li>a</li>\\n<li>b</li>\\n</ol>\"\n        )\n\n    def test_rule(self):\n        self.assertEqual(render_blocks(\"---\"), \"<hr>\")\n\n    def test_blockquote_can_hold_blocks(self):\n        self.assertEqual(\n            render_blocks(\"> # Hi\\n> there\"), \"<blockquote><h1>Hi</h1>\\n<p>there</p></blockquote>\"\n        )\n\n    def test_code_block_is_escaped(self):\n        out = render_blocks(\"```html\\n<b>x</b>\\n```\")\n        self.assertEqual(\n            out, '<pre><code class=\"language-html\">&lt;b&gt;x&lt;/b&gt;</code></pre>'\n        )\n\n    def test_heading_followed_by_text(self):\n        self.assertEqual(render_blocks(\"# T\\ntext\"), \"<h1>T</h1>\\n<p>text</p>\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "write",
+   "path": "tests/test_render.py",
+   "content": "import os\nimport tempfile\nimport unittest\n\nimport convert\nfrom mdlite.render import extract_title, render_page\n\n\nclass RenderTests(unittest.TestCase):\n    def test_title_comes_from_first_heading(self):\n        self.assertEqual(extract_title(\"intro\\n# Real Title\\n\"), \"Real Title\")\n\n    def test_title_default(self):\n        self.assertEqual(extract_title(\"no heading\"), \"Document\")\n\n    def test_page_wraps_body(self):\n        page = render_page(\"# Hi\\n\\ntext\")\n        self.assertIn(\"<title>Hi</title>\", page)\n        self.assertIn(\"<h1>Hi</h1>\", page)\n        self.assertTrue(page.rstrip().endswith(\"</html>\"))\n\n    def test_convert_writes_file(self):\n        with tempfile.TemporaryDirectory() as tmp:\n            source = os.path.join(tmp, \"doc.md\")\n            with open(source, \"w\", encoding=\"utf-8\") as handle:\n                handle.write(\"# Doc\\n\\n**bold**\")\n            self.assertEqual(convert.main([source]), 0)\n            with open(os.path.join(tmp, \"doc.html\"), encoding=\"utf-8\") as handle:\n                self.assertIn(\"<strong>bold</strong>\", handle.read())\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  {
+   "type": "run",
+   "command": "{PY} -m unittest -v",
+   "wait": 6
+  },
+  {
+   "type": "write",
+   "path": "README.md",
+   "content": "# MarkdownLite\n\nConvert Markdown to a standalone HTML page with plain Python.\n\n    python convert.py sample.md        # writes sample.html\n    python -m unittest -v\n"
+  }
+ ]
+}
